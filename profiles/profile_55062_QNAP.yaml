@@ -1,0 +1,19 @@
+profiles:
+  # Shared hint block for QNAP-style devices
+  qnap_common_hints: &qnap_hints
+    disk:
+      - "1.3.6.1.4.1.24681.1.3.11" # classic QNAP disk subtree
+      - "1.3.6.1.4.1.55062.1.10.2" # qnapQTS/storage/Diskinfo
+    fan:
+      - "1.3.6.1.4.1.24681.1.3.13" # classic fan table
+      - "1.3.6.1.4.1.55062.1.12.9" # sysFanTable
+    temp:
+      - "1.3.6.1.4.1.55062.1.10.3" # Temperature_Celsius / Airflow_Temperature_Cel
+
+  "55062": # QNAP via enterprises.55062
+    name: "QNAP-55062"
+    hints: *qnap_hints
+
+  "24681": # QNAP via enterprises.24681
+    name: "QNAP-24681"
+    hints: *qnap_hints

@@ -1,0 +1,9 @@
+profiles:
+  "14988": # MikroTik
+    name: "MikroTik"
+    hints:
+      if:
+        - "1.3.6.1.2.1.2.2.1"
+        - "1.3.6.1.2.1.31.1.1"
+      wireless:
+        - "1.3.6.1.4.1.14988.1.1" # wireless interfaces / stats

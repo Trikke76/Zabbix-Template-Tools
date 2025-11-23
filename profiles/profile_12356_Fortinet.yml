@@ -1,0 +1,8 @@
+profiles:
+  "12356": # Fortinet
+    name: "Fortinet"
+    hints:
+      if:
+        - "1.3.6.1.2.1.2.2.1"
+      session:
+        - "1.3.6.1.4.1.12356.101.4" # session table (varies by model)

@@ -3,7 +3,7 @@
 oid2zabbix-template.py
 ======================
 
-Version: 1.0.6
+Version: 1.0.7
 
 Take an auto_oid_finder profile YAML and turn it into a Zabbix 7.0 template.
 
@@ -37,7 +37,7 @@ import uuid
 
 import yaml
 
-VERSION = "1.0.6"
+VERSION = "1.0.7"
 
 ZABBIX_EXPORT_VERSION = "7.0"
 
@@ -71,6 +71,32 @@ def log_error(msg: str):
 def log_debug(msg: str):
     if DEBUG:
         print(f"[debug] {msg}")
+
+# ---------------------------------------------------------------------------
+# Dedup helpers for item keys
+# ---------------------------------------------------------------------------
+
+def append_unique_item(target_list, item_dict, used_keys: set, context: str = "item"):
+    """
+    Append an item dict to target_list, but only if its key is not already used.
+
+    - target_list: the list (items or item_prototypes) to append to
+    - item_dict: the Zabbix item dict (must have 'key' or 'key_')
+    - used_keys: a set() tracking keys we've already emitted
+    - context: 'item' or 'prototype' (for warning messages only)
+    """
+    key = item_dict.get("key") or item_dict.get("key_")
+    if not key:
+        # No key? Just append, nothing to dedup on.
+        target_list.append(item_dict)
+        return
+
+    if key in used_keys:
+        log_warn(f"Skipping duplicate {context} key: {key}")
+        return
+
+    used_keys.add(key)
+    target_list.append(item_dict)
 
 
 # ---------------------------------------------------------------------------
@@ -259,8 +285,7 @@ def make_scalar_item(entry: dict) -> dict:
 
     return item
 
-
-def make_table_lld(table: dict) -> tuple[list[dict], dict]:
+def make_table_lld(table: dict, used_proto_keys: set[str]) -> tuple[list[dict], dict]:
     """
     Build master SNMP walk item + discovery rule for a given table entry.
 
@@ -380,7 +405,7 @@ def make_table_lld(table: dict) -> tuple[list[dict], dict]:
         if full_desc:
             proto["description"] = full_desc
 
-        dr["item_prototypes"].append(proto)
+        append_unique_item(dr["item_prototypes"], proto, used_proto_keys, context="prototype")
 
     return [master_item], dr
 
@@ -418,6 +443,11 @@ def build_zabbix_template(
 
     items: list[dict] = []
     discovery_rules: list[dict] = []
+
+    # Track keys to avoid duplicates across the whole template
+    used_item_keys: set[str] = set()
+    used_proto_keys: set[str] = set()
+
 
     # Collect table roots (normalized)
     table_roots = []
@@ -466,7 +496,7 @@ def build_zabbix_template(
             except Exception as e:
                 log_warn(f"Skipping scalar {s.get('oid')}: {e}")
                 continue
-            items.append(item)
+            append_unique_item(items, item, used_item_keys, context="item")
             scalar_count += 1
 
     table_count = 0
@@ -479,7 +509,7 @@ def build_zabbix_template(
                 continue
 
             try:
-                masters, dr = make_table_lld(t)
+                masters, dr = make_table_lld(t, used_proto_keys)
             except Exception as e:
                 log_warn(f"Skipping table at {t.get('root_oid')}: {e}")
                 continue

@@ -3,64 +3,12 @@
 auto_oid_finder.py
 ==================
 
-Version: 1.0.3
+Version: 1.0.7
 
 Scan an SNMP device, discover scalar OIDs and table-like OID patterns,
 enrich them (optionally) with MIB names/descriptions via snmptranslate
 and Observium MIBs, and write a YAML "profile" that can be fed into
 oid2zabbix-template.py to build a Zabbix 7.0 template.
-
-Key ideas
----------
-
-- Use one or more root OIDs (default: .1.3.6.1.2.1) and walk them via SNMP.
-- Classify OIDs into:
-    * scalars: OIDs ending in ".0"
-    * tables:  clusters of OIDs that look like SNMP tables
-- For each scalar:
-    * store oid, sample type+value, value_class, module/name/description
-    * keep *all* scalars in YAML, but add 'selected: true/false'
-      based on a filter regex (unless --no-filter).
-- For each table:
-    * detect approximate row/column counts
-    * pick example OIDs
-    * detect columns and enrich via snmptranslate
-
-Output YAML layout (simplified)
--------------------------------
-
-target:
-  host: 1.2.3.4
-  community: public
-  root_oids:
-    - .1.3.6.1.2.1
-
-scalars:
-  - oid: ".1.3.6.1.4.1.24681.1.3.1.0"
-    sample_type: "INTEGER"
-    sample_value: 42
-    value_class: "UNSIGNED"
-    module: "QTS-MIB"
-    name: "cpuUsageEX"
-    description: "..."
-    selected: true
-
-tables:
-  - root_oid: ".1.3.6.1.2.1.2.2.1"
-    approx_rows: 4
-    approx_columns: 6
-    example_oids:
-      - ".1.3.6.1.2.1.2.2.1.1.1"
-      - ".1.3.6.1.2.1.2.2.1.1.2"
-    columns:
-      - prefix: ".1.3.6.1.2.1.2.2.1.2"
-        module: "IF-MIB"
-        name: "ifDescr"
-        description: "..."
-        sample_type: "OCTET STRING"
-        value_class: "TEXT"
-
-The resulting YAML is consumed by oid2zabbix-template.py.
 """
 
 import argparse
@@ -70,19 +18,20 @@ import subprocess
 import sys
 import time
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 
 import yaml
 
-VERSION = "1.0.3"
+VERSION = "1.0.7"
 
-DEFAULT_ROOT = ".1.3.6.1.2.1"  # MIB-2
+# Default roots: vendor (enterprise) + MIB-2
+DEFAULT_ROOTS = [".1.3.6.1.4.1", ".1.3.6.1.2.1"]
 DEFAULT_COMMUNITY = "public"
 DEFAULT_PORT = 161
 DEFAULT_TIMEOUT = 2
 DEFAULT_RETRIES = 1
 
-# This is the same "signal words" filter we used everywhere.
+# Legacy single-filter default (used when no --filter-file is provided)
 DEFAULT_FILTER_REGEX = (
     r"(temp|temperature|thermal|fan|cool|psu|ps|power|volt|current|amps|"
     r"cpu|load|usage|util|mem|memory|swap|disk|hdd|ssd|raid|array|lun|"
@@ -112,6 +61,32 @@ def log_error(msg: str):
 def log_debug(msg: str):
     if DEBUG:
         print(f"[debug] {msg}")
+
+# ---------------------------------------------------------------------------
+# Dedup helpers for item keys
+# ---------------------------------------------------------------------------
+
+def append_unique_item(target_list, item_dict, used_keys: set, context: str = "item"):
+    """
+    Append an item dict to target_list, but only if its key is not already used.
+
+    - target_list: the list (items or item_prototypes) to append to
+    - item_dict: the Zabbix item dict (must have 'key' or 'key_')
+    - used_keys: a set() tracking keys we've already emitted
+    - context: 'item' or 'prototype' (for warning messages only)
+    """
+    key = item_dict.get("key") or item_dict.get("key_")
+    if not key:
+        # No key? Just append, nothing to dedup on.
+        target_list.append(item_dict)
+        return
+
+    if key in used_keys:
+        print(f"[warn] Skipping duplicate {context} key: {key}", file=sys.stderr)
+        return
+
+    used_keys.add(key)
+    target_list.append(item_dict)
 
 
 # ---------------------------------------------------------------------------
@@ -184,7 +159,9 @@ def snmptranslate_enrich(
 
     Returns (module, name, description) or (None, None, None) if not resolvable.
     """
-    cmd = ["snmptranslate", "-m", "+ALL", "-Td", oid]
+    # -Td : dump full OBJECT-TYPE definition
+    # -OS : show module::symbolicName in output
+    cmd = ["snmptranslate", "-m", "+ALL", "-Td", "-OS", oid]
     env = os.environ.copy()
 
     if observium_dir:
@@ -195,36 +172,28 @@ def snmptranslate_enrich(
 
     log_debug(f"snmptranslate cmd: {' '.join(cmd)}")
     try:
-        out = subprocess.check_output(
-            cmd, env=env, stderr=subprocess.DEVNULL, text=True
+        # Capture raw bytes and decode manually so we don't crash on non-UTF-8
+        out_bytes = subprocess.check_output(
+            cmd, env=env, stderr=subprocess.DEVNULL
         )
+        out = out_bytes.decode("utf-8", errors="replace")
     except Exception:
         return None, None, None
 
-    module = None
-    name = None
-    desc = None
+    module: str | None = None
+    name: str | None = None
+    desc: str | None = None
 
+    # First non-empty line normally looks like:
+    #   SNMPv2-MIB::sysDescr
     for line in out.splitlines():
         line = line.strip()
-        if "::" in line and "Object" in line and "OID" in line:
-            # e.g. "QTS-MIB::cpuUsageEX OBJECT-TYPE"
-            m = re.match(r"^([A-Za-z0-9\-]+)::([A-Za-z0-9_\-]+)\s+OBJECT-TYPE", line)
-            if m:
-                module, name = m.group(1), m.group(2)
-        elif line.startswith("DESCRIPTION"):
-            # Next lines until the closing quote
-            desc_lines = []
-            # The line may be 'DESCRIPTION "text...' or just 'DESCRIPTION "'
-            first_quote = line.find('"')
-            if first_quote != -1 and line.count('"') >= 2:
-                # Single-line description
-                inner = line[first_quote + 1 : line.rfind('"')]
-                desc_lines.append(inner)
-            else:
-                # Multi-line, read subsequent lines
-                # We'll just split on quotes in the total output later
-                pass
+        if not line:
+            continue
+        m = re.match(r"^([A-Za-z0-9\-]+)::([A-Za-z0-9_\-]+)\b", line)
+        if m:
+            module, name = m.group(1), m.group(2)
+            break
 
     # Description parsing: coarse but safe
     # Extract between first DESCRIPTION " and the matching closing ".
@@ -272,7 +241,9 @@ def run_snmpwalk(
     log_debug(" ".join(cmd))
 
     try:
-        out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
+        # Capture raw bytes; decode ourselves to avoid UnicodeDecodeError
+        out_bytes = subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
+        out = out_bytes.decode("utf-8", errors="replace")
     except subprocess.CalledProcessError as e:
         log_error(f"snmpwalk failed: {e}")
         return []
@@ -326,97 +297,47 @@ def classify_value_class(snmp_type: str, value: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Scalar selection logic
-# ---------------------------------------------------------------------------
-
-def decide_scalar_selected(
-    oid: str,
-    name: str | None,
-    description: str | None,
-    filter_re: re.Pattern | None,
-    no_filter: bool = False,
-) -> bool:
-    """
-    Decide whether a scalar should be marked as 'selected' in the profile.
-
-    Rules:
-      - If --no-filter: always True.
-      - If filter_re is None: always True.
-      - Else: selected if filter matches ANY of:
-          * name (from MIB / Observium)
-          * description
-          * a key-like variant of the name
-          * the OID string itself
-      - Bonus: standard SNMP scalars under .1.3.6.1.2.1.*.0 are always selected.
-    """
-    if no_filter:
-        return True
-
-    if filter_re is None:
-        return True
-
-    oid = oid or ""
-    name = (name or "").strip()
-    description = (description or "").strip()
-
-    # Standard MIB-2 scalar fallback:
-    # .1.3.6.1.2.1.<X>.0  (sysUpTime, etc.)
-    if oid.startswith(".1.3.6.1.2.1.") and oid.endswith(".0"):
-        return True
-
-    # Build key candidate (sanitized name)
-    key_candidate = name.replace("::", "_").replace(" ", "_")
-
-    fields = [
-        name,
-        description,
-        key_candidate,
-        oid,
-    ]
-
-    for f in fields:
-        if f and filter_re.search(f):
-            return True
-
-    return False
-
-
-# ---------------------------------------------------------------------------
 # Table detection (coarse but effective)
 # ---------------------------------------------------------------------------
 
 def split_oid(oid: str) -> list[int]:
     return [int(x) for x in oid.lstrip(".").split(".") if x.isdigit()]
 
-
 def detect_tables(oid_list: list[str]) -> list[dict]:
     """
     Very coarse SNMP "table" detection:
 
-    - Group all non-scalar OIDs by a prefix of N components (default: len-2).
-    - For each prefix, count distinct row indexes and columns.
-    - Only keep groups that look like a table: rows >= 2 and columns >= 2.
+    We assume typical table OIDs look like:
 
-    Result is a list of:
-      {
-        "root_oid": ".1.3.6.1.2.1.2.2.1",
-        "approx_rows": N,
-        "approx_columns": M,
-        "example_oids": [...],
-      }
+        <base>.<table>.<entry>.<column>.<index>
+
+    e.g. IF-MIB::ifDescr.1 =
+         .1.3.6.1.2.1.2.2.1.2.1
+         [1,3,6,1,2,1,2,2,1,2,1]
+          <--------root------><c><i>
+
+    Heuristic:
+      - For each non-scalar OID with at least 4 components, take all but the
+        last TWO components as a candidate "table root".
+      - The remaining tail is at least [column, index].
+      - The last component in tail is treated as row index, the one before it
+        as column id.
+      - We keep groups that have at least 2 distinct rows and 2 distinct
+        columns.
     """
     # Filter out scalars (ending in .0)
     non_scalars = [o for o in oid_list if not o.endswith(".0")]
 
-    # Map: root_prefix -> list of oids
     clusters: dict[str, list[str]] = defaultdict(list)
 
     for oid in non_scalars:
         parts = split_oid(oid)
-        if len(parts) < 3:
+        # Need at least: ....<col>.<idx>
+        if len(parts) < 4:
             continue
-        # Take all but last component as a candidate root
-        root = "." + ".".join(str(x) for x in parts[:-1])
+        # Candidate table root = everything except the last *two* components
+        root_parts = parts[:-2]
+        root = "." + ".".join(str(x) for x in root_parts)
         clusters[root].append(oid)
 
     tables: list[dict] = []
@@ -428,17 +349,21 @@ def detect_tables(oid_list: list[str]) -> list[dict]:
         row_indices = set()
         col_indices = set()
 
+        root_parts = split_oid(root)
+
         for o in oids:
             parts = split_oid(o)
-            root_parts = split_oid(root)
+            if len(parts) <= len(root_parts):
+                continue
             tail = parts[len(root_parts):]
             if len(tail) == 0:
                 continue
+
             # Last component is usually index
             idx = tail[-1]
             row_indices.add(idx)
 
-            # The "column" is often the one before last, but SNMP tables vary.
+            # The "column" is the component before the index
             if len(tail) >= 2:
                 col = tail[-2]
                 col_indices.add(col)
@@ -543,7 +468,8 @@ def build_profile(
     timeout: int,
     retries: int,
     observium_dir: str | None,
-    filter_re: re.Pattern | None,
+    mib2_filter_re: re.Pattern | None,
+    vendor_filter_re: re.Pattern | None,
     no_filter: bool,
 ) -> tuple[dict, dict]:
     """
@@ -584,14 +510,32 @@ def build_profile(
             "description": desc,
         }
 
-        scalar_entry["selected"] = decide_scalar_selected(
-            oid=oid,
-            name=name,
-            description=desc,
-            filter_re=filter_re,
-            no_filter=no_filter,
-        )
+        # Decide which filter to use based on OID tree
+        if oid.startswith(".1.3.6.1.2.1."):          # MIB-2
+            active_re = mib2_filter_re
+        elif oid.startswith(".1.3.6.1.4.1."):       # vendor / enterprise
+            active_re = vendor_filter_re
+        else:
+            # fallback: use vendor filter, or mib2 filter, or None
+            active_re = vendor_filter_re or mib2_filter_re
 
+        # Apply selection filter
+        if no_filter:
+            selected = True
+        elif active_re is None:
+            # No regex configured for this tree => default to not selected
+            selected = False
+        else:
+            text = " ".join([
+                oid,
+                module or "",
+                name or "",
+                desc or "",
+                str(value or ""),
+            ])
+            selected = bool(active_re.search(text))
+
+        scalar_entry["selected"] = selected
         scalars.append(scalar_entry)
 
     # Detect tables
@@ -600,13 +544,47 @@ def build_profile(
     tables: list[dict] = []
     for t in tables_meta:
         cols = derive_table_columns(t, all_oids, observium_dir)
+
+        # Table-level filtering:
+        # Keep only columns whose name/description matches the active filter
+        # (MIB-2 vs vendor). If no columns survive, we drop the table entirely.
+        interesting_cols: list[dict] = []
+
+        for col in cols:
+            prefix = col.get("prefix") or ""
+            module = col.get("module") or ""
+            name = col.get("name") or ""
+            desc = col.get("description") or ""
+
+            # Decide which filter to use based on column OID tree
+            if prefix.startswith(".1.3.6.1.2.1."):          # MIB-2
+                active_re = mib2_filter_re
+            elif prefix.startswith(".1.3.6.1.4.1."):       # vendor / enterprise
+                active_re = vendor_filter_re
+            else:
+                active_re = vendor_filter_re or mib2_filter_re
+
+            if no_filter or active_re is None:
+                # No filtering -> keep everything
+                interesting_cols.append(col)
+            else:
+                text = " ".join([prefix, module, name, desc])
+                if active_re.search(text):
+                    interesting_cols.append(col)
+
+        # Drop tables that have no interesting columns at all
+        if not interesting_cols:
+            continue
+
         t_with_cols = dict(t)
-        t_with_cols["columns"] = cols
+        t_with_cols["columns"] = interesting_cols
         tables.append(t_with_cols)
 
     profile = {
         "version": "auto_oid_profile_v1",
-        "generated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "generated_at": datetime.now(timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z"),
         "target": {
             "host": host,
             "community": community,
@@ -660,7 +638,7 @@ def main():
         action="append",
         help=(
             "Root OID to walk (numeric). Can be used multiple times. "
-            f"Default: {DEFAULT_ROOT}"
+            f"Default: {', '.join(DEFAULT_ROOTS)}"
         ),
     )
     parser.add_argument(
@@ -681,12 +659,16 @@ def main():
     )
     parser.add_argument(
         "--filter",
-        help="Regex to decide which OIDs are 'interesting' (default: built-in)",
+        help="Legacy single regex for 'interesting' OIDs (used if no --filter-file is provided)",
+    )
+    parser.add_argument(
+        "--filter-file",
+        help="YAML file defining separate filters for MIB-2 and vendor trees",
     )
     parser.add_argument(
         "--no-filter",
         action="store_true",
-        help="Disable filter; mark all scalars as selected",
+        help="Disable filters; mark all scalars as selected",
     )
     parser.add_argument(
         "--debug",
@@ -722,16 +704,58 @@ def main():
     DEBUG = args.debug
     log_info(f"auto_oid_finder.py version: {VERSION}")
 
-    roots = args.root or [DEFAULT_ROOT]
+    # Determine roots
+    roots = args.root or DEFAULT_ROOTS
 
-    # Filter regex
-    filter_pattern: re.Pattern | None = None
-    if args.no_filter:
-        log_info("Filter disabled (--no-filter). All scalars will be marked selected.")
-    else:
-        pattern = args.filter or DEFAULT_FILTER_REGEX
-        filter_pattern = re.compile(pattern, re.IGNORECASE)
-        log_info(f"Using filter regex: '{pattern}'")
+    # Filter regexes
+    mib2_filter_re: re.Pattern | None = None
+    vendor_filter_re: re.Pattern | None = None
+
+    if args.filter_file:
+        # Load from external YAML
+        try:
+            with open(args.filter_file, "r", encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+        except Exception as e:
+            log_error(f"Failed to load filter file '{args.filter_file}': {e}")
+            cfg = {}
+
+        mib2_cfg = cfg.get("mib2") or {}
+        vendor_cfg = cfg.get("vendor") or {}
+
+        if "regex" in mib2_cfg:
+            try:
+                mib2_filter_re = re.compile(
+                    mib2_cfg["regex"],
+                    re.IGNORECASE | re.VERBOSE,
+                )
+                log_info(f"MIB-2 filter regex: '{mib2_cfg['regex']}'")
+            except re.error as e:
+                log_error(f"Invalid MIB-2 filter regex: {e}")
+        
+        if "regex" in vendor_cfg:
+            try:
+                vendor_filter_re = re.compile(
+                    vendor_cfg["regex"],
+                    re.IGNORECASE | re.VERBOSE,
+                )
+                log_info(f"Vendor filter regex: '{vendor_cfg['regex']}'")
+            except re.error as e:
+                log_error(f"Invalid vendor filter regex: {e}")
+
+    if not args.filter_file:
+        if args.no_filter:
+            log_info("Filter disabled (--no-filter). All scalars will be marked selected.")
+        else:
+            pattern = args.filter or DEFAULT_FILTER_REGEX
+            try:
+                vendor_filter_re = re.compile(pattern, re.IGNORECASE)
+                mib2_filter_re = vendor_filter_re
+                log_info(f"Using single filter regex: '{pattern}'")
+            except re.error as e:
+                log_error(f"Invalid filter regex '{pattern}': {e}")
+                vendor_filter_re = None
+                mib2_filter_re = None
 
     # Observium MIBs
     observium_dir = None
@@ -760,7 +784,8 @@ def main():
         timeout=args.timeout,
         retries=args.retries,
         observium_dir=observium_dir,
-        filter_re=filter_pattern,
+        mib2_filter_re=mib2_filter_re,
+        vendor_filter_re=vendor_filter_re,
         no_filter=args.no_filter,
     )
     elapsed = time.time() - t0

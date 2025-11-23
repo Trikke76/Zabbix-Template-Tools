@@ -1,0 +1,9 @@
+profiles:
+  "2636": # Juniper
+    name: "Juniper"
+    hints:
+      if:
+        - "1.3.6.1.2.1.2.2.1"
+        - "1.3.6.1.2.1.31.1.1"
+      chassis:
+        - "1.3.6.1.4.1.2636.3.1" # chassis hardware (FPC, PIC, etc.)
