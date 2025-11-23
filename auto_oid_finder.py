@@ -3,6 +3,8 @@
 auto_oid_finder.py
 ==================
 
+Version: 1.0.2
+
 Scan a device via SNMP and discover:
 
   * Interesting TABLES (for LLD)
@@ -26,7 +28,6 @@ Output: a YAML file with:
 
 Intended to be consumed later by:
   - oid2zabbix-template.py
-  - zbx_lld_builder.py
 """
 
 import argparse
@@ -50,6 +51,7 @@ from pysnmp.proto.rfc1902 import (
     TimeTicks,
 )
 
+VERSION = "1.0.1"
 DEBUG = False
 
 # Observium MIB repo – we sync this into ./observium_mibs
@@ -626,6 +628,40 @@ def enrich_tables_with_mibs(
 
 
 # ---------------------------------------------------------------------------
+# Output path helper
+# ---------------------------------------------------------------------------
+
+def make_output_path(host: str, explicit_output: Optional[str]) -> str:
+    """
+    Decide where to write the auto_oid profile.
+
+    - Default directory: ./export_yaml/
+    - If explicit_output is given:
+        * If it has a directory component, use as-is (creating dirs).
+        * If it's just a filename, place it under ./export_yaml/.
+    - If no explicit_output:
+        * Use auto_oid_<host>_<timestamp>.yaml under ./export_yaml/.
+    """
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    default_dir = os.path.join(script_dir, "export_yaml")
+    os.makedirs(default_dir, exist_ok=True)
+
+    if explicit_output:
+        if os.path.dirname(explicit_output):
+            # User supplied a path with a directory – respect it
+            out_dir = os.path.dirname(explicit_output)
+            os.makedirs(out_dir, exist_ok=True)
+            return explicit_output
+        # Bare filename: drop into export_yaml
+        return os.path.join(default_dir, explicit_output)
+
+    ts = datetime.now().strftime("%Y%m%d%H%M")
+    safe_host = host.replace(":", "_").replace("/", "_")
+    filename = f"auto_oid_{safe_host}_{ts}.yaml"
+    return os.path.join(default_dir, filename)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -648,7 +684,7 @@ def main():
             "use Observium MIBs to enrich OIDs with names/descriptions."
         )
     )
-    parser.add_argument("--host", required=True, help="Target host/IP")
+    parser.add_argument("--host", help="Target host/IP")
     parser.add_argument(
         "--community",
         default="public",
@@ -679,7 +715,10 @@ def main():
     )
     parser.add_argument(
         "--output",
-        help="Output YAML file (default: auto_oid_<host>_<timestamp>.yaml)",
+        help=(
+            "Output YAML file. If it's just a filename, it will be placed in "
+            "./export_yaml/ by default."
+        ),
     )
     parser.add_argument(
         "--filter",
@@ -708,9 +747,24 @@ def main():
         action="store_true",
         help="Disable Observium MIB enrichment (no sync, no snmptranslate lookups).",
     )
+    parser.add_argument(
+        "--version",
+        action="store_true",
+        help="Show script version and exit.",
+    )
 
     args = parser.parse_args()
+
+    if args.version:
+        print(f"auto_oid_finder.py version {VERSION}")
+        sys.exit(0)
+
+    if not args.host:
+        parser.error("the following arguments are required: --host")
+
     DEBUG = args.debug
+
+    log_info(f"auto_oid_finder version: {VERSION}")
 
     host = args.host
     community = args.community
@@ -733,13 +787,8 @@ def main():
             sys.exit(1)
         log_info(f"Using filter regex: {pattern!r}")
 
-    # Output file
-    if args.output:
-        output_path = args.output
-    else:
-        ts = datetime.now().strftime("%Y%m%d%H%M")
-        safe_host = host.replace(":", "_").replace("/", "_")
-        output_path = f"auto_oid_{safe_host}_{ts}.yaml"
+    # Output file (now goes to ./export_yaml by default)
+    output_path = make_output_path(host, args.output)
 
     # Observium MIB directory (under this script's directory)
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -856,4 +905,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -1,4 +1,5 @@
 venv
 observium_mibs/
 mibs/
-auto_oid_*
+export_template/
+export_yaml/
