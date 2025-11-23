@@ -7,6 +7,8 @@ Extract interesting scalar OIDs from a MIB file using net-snmp's snmptranslate
 and write them to a YAML "OID catalog" for later consumption by
 oid2zabbix-template.py and auto_oid_finder.py.
 
+VERSION = "1.0.0"
+
 Backend flow:
 
   1) Pre-flight: check core MIB support
@@ -538,6 +540,8 @@ def build_oid_catalog(
             "generated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
             "filter": filter_regex.pattern if filter_regex else None,
             "oids": [],
+            "tool": "mib2oid",
+            "tool_version": VERSION,
         }
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         with open(output_path, "w", encoding="utf-8") as f:
@@ -821,6 +825,14 @@ def main():
             "  5) If all fails, fall back to auto_oid_finder.py.\n"
         )
     )
+
+    parser.add_argument(
+        "-V", "--version",
+        action="version",
+        version=f"mib2oid.py version {VERSION}",
+        help="Show version and exit",
+    )
+
     parser.add_argument("mib_file", help="Path to MIB file (e.g. QTS-MIB.mib)")
     parser.add_argument(
         "--module",

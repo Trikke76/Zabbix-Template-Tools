@@ -3,18 +3,22 @@
 oid2zabbix-template.py
 ======================
 
-Version: 1.0.5
+Version: 1.0.6
 
 Take an auto_oid_finder profile YAML and turn it into a Zabbix 7.0 template.
 
 Scalars:
-  - treated as regular SNMP items
-  - key:      <MIB-name or derived>
-  - snmp_oid: get[.OID]
+  - stored in profile with:
+        oid: ".1.3.6.1..."
+        name: "..."
+        description: "..."
+        value_class: "UNSIGNED|TEXT|..."
+        selected: true/false      # <-- from auto_oid_finder
+  - by default, we only export scalars where selected == true
+  - use --all-scalars to export every scalar regardless of 'selected'
 
 Tables:
   - treated as LLD only
-  - NO extra regular items for OIDs under table roots
   - master item:
       key:      snmp.raw.walk[<root_oid_compact>]
       snmp_oid: walk[.root_oid]
@@ -33,7 +37,7 @@ import uuid
 
 import yaml
 
-VERSION = "1.0.5"
+VERSION = "1.0.6"
 
 ZABBIX_EXPORT_VERSION = "7.0"
 
@@ -397,6 +401,7 @@ def build_zabbix_template(
     include_tables: bool = True,
     min_rows: int = 2,
     min_cols: int = 2,
+    all_scalars: bool = False,
 ) -> tuple[dict, dict]:
     """
     Build the full Zabbix export structure from an auto_oid_finder profile.
@@ -405,6 +410,8 @@ def build_zabbix_template(
       - Any scalar whose OID lives under a table root is SKIPPED as a
         regular item, to avoid having both a normal item and an LLD
         item for the same data.
+      - By default, we only export scalars where entry['selected'] is True.
+        Use all_scalars=True to ignore that flag and export everything.
     """
     scalars = profile.get("scalars") or []
     tables = profile.get("tables") or []
@@ -433,16 +440,27 @@ def build_zabbix_template(
         return False
 
     scalar_count = 0
+    total_scalars = len(scalars)
+
     if include_scalars:
         for s in scalars:
             oid = s.get("oid")
             if not oid:
                 continue
+
+            # skip scalars that belong to table subtrees
             if scalar_belongs_to_table(oid):
                 log_debug(
                     f"Skipping scalar {oid} because it is under table root subtree"
                 )
                 continue
+
+            if not all_scalars:
+                # honor 'selected' from profile (default True for legacy profiles)
+                if not s.get("selected", True):
+                    log_debug(f"Skipping scalar {oid} because selected=False")
+                    continue
+
             try:
                 item = make_scalar_item(s)
             except Exception as e:
@@ -509,6 +527,7 @@ def build_zabbix_template(
 
     stats = {
         "scalar_items": scalar_count,
+        "scalar_total": total_scalars,
         "tables_used": table_count,
         "discovery_rules": lld_count,
         "items_total": len(items),
@@ -530,7 +549,9 @@ def main():
             "Scalars: key = MIB name, snmp_oid = get[OID].\n"
             "Tables: master item snmp_oid = walk[root], item prototypes\n"
             "snmp_oid = get[prefix.{#SNMPINDEX}], key = MIBname_OIDtail[{#SNMPINDEX}].\n"
-            "Scalars under table roots are NOT exported as regular items."
+            "Scalars under table roots are NOT exported as regular items.\n"
+            "By default, only scalars with selected=true are exported; use "
+            "--all-scalars to include every scalar."
         )
     )
     parser.add_argument(
@@ -588,6 +609,11 @@ def main():
         help="Minimum approx_columns for a table to be included (default: 2)",
     )
     parser.add_argument(
+        "--all-scalars",
+        action="store_true",
+        help="Include ALL scalar OIDs (ignore 'selected' flag in profile)",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug logging",
@@ -637,6 +663,7 @@ def main():
     log_info(f"Output file:       {out_path}")
     log_info(f"Include scalars:   {not args.no_scalars}")
     log_info(f"Include tables:    {not args.no_tables}")
+    log_info(f"All scalars:       {args.all_scalars}")
     log_info(f"Min table rows:    {args.min_rows}")
     log_info(f"Min table columns: {args.min_cols}")
 
@@ -650,6 +677,7 @@ def main():
         include_tables=not args.no_tables,
         min_rows=args.min_rows,
         min_cols=args.min_cols,
+        all_scalars=args.all_scalars,
     )
 
     with open(out_path, "w", encoding="utf-8") as f:
@@ -662,15 +690,15 @@ def main():
         )
 
     print("\n[summary]")
-    print(f"  Template name:    {template_name}")
-    print(f"  Template group:   {group_name}")
-    print(f"  Vendor:           {vendor}")
-    print(f"  Template version: {template_version}")
-    print(f"  Output file:      {out_path}")
-    print(f"  Scalar items:     {stats['scalar_items']}")
-    print(f"  Tables used:      {stats['tables_used']}")
-    print(f"  Discovery rules:  {stats['discovery_rules']}")
-    print(f"  Total items:      {stats['items_total']}")
+    print(f"  Template name:      {template_name}")
+    print(f"  Template group:     {group_name}")
+    print(f"  Vendor:             {vendor}")
+    print(f"  Template version:   {template_version}")
+    print(f"  Output file:        {out_path}")
+    print(f"  Scalar items:       {stats['scalar_items']} / {stats['scalar_total']} in profile")
+    print(f"  Tables used:        {stats['tables_used']}")
+    print(f"  Discovery rules:    {stats['discovery_rules']}")
+    print(f"  Total items:        {stats['items_total']}")
     print("[info] Zabbix template YAML ready for import into Zabbix 7.0.")
 
 
