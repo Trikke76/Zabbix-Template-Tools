@@ -72,6 +72,7 @@ def log_debug(msg: str):
     if DEBUG:
         print(f"[debug] {msg}")
 
+
 # ---------------------------------------------------------------------------
 # Dedup helpers for item keys
 # ---------------------------------------------------------------------------
@@ -285,6 +286,7 @@ def make_scalar_item(entry: dict) -> dict:
 
     return item
 
+
 def make_table_lld(table: dict, used_proto_keys: set[str]) -> tuple[list[dict], dict]:
     """
     Build master SNMP walk item + discovery rule for a given table entry.
@@ -340,6 +342,38 @@ def make_table_lld(table: dict, used_proto_keys: set[str]) -> tuple[list[dict], 
         ],
     }
 
+    # JavaScript pre-processing to turn raw snmpwalk text into LLD JSON
+    js_lld = """\
+var lines = value.split('\\n');
+var idxMap = {};
+for (var i = 0; i < lines.length; i++) {
+    var line = lines[i].trim();
+    if (!line || line.indexOf('=') === -1) continue;
+
+    // capture OID part: .1.3.6.1.4.1.x.x.x
+    var m = line.match(/^(\\.[0-9.]+)\\s+=/);
+    if (!m) continue;
+
+    var oid = m[1];
+    var parts = oid.split('.');
+    if (parts.length < 2) continue;
+
+    var idx = parts[parts.length - 1];
+    if (!idx) continue;
+
+    idxMap[idx] = true;
+}
+
+var data = [];
+for (var k in idxMap) {
+    if (idxMap.hasOwnProperty(k)) {
+        data.push({ "{#SNMPINDEX}": k });
+    }
+}
+
+return JSON.stringify({ "data": data });
+"""
+
     dr = {
         "uuid": uuid.uuid4().hex,
         "name": f"Auto LLD for {root_oid}",
@@ -350,9 +384,13 @@ def make_table_lld(table: dict, used_proto_keys: set[str]) -> tuple[list[dict], 
         "description": desc,
         "preprocessing": [
             {
+                "type": "JAVASCRIPT",
+                "parameters": [js_lld],
+            },
+            {
                 "type": "DISCARD_UNCHANGED_HEARTBEAT",
                 "parameters": ["1h"],
-            }
+            },
         ],
         "item_prototypes": [],
         "trigger_prototypes": [],
@@ -374,7 +412,9 @@ def make_table_lld(table: dict, used_proto_keys: set[str]) -> tuple[list[dict], 
         elif name:
             proto_name = name
         else:
-            proto_name = prefix
+            # Fallback: avoid using a raw OID as the UI name
+            last_arc = prefix.split(".")[-1] if prefix else "col"
+            proto_name = f"col_{last_arc}"
 
         col_snmp_oid = f"{prefix}.{{#SNMPINDEX}}"
         proto_key = build_column_key(col, root_oid)
@@ -448,7 +488,6 @@ def build_zabbix_template(
     used_item_keys: set[str] = set()
     used_proto_keys: set[str] = set()
 
-
     # Collect table roots (normalized)
     table_roots = []
     for t in tables:
@@ -514,7 +553,8 @@ def build_zabbix_template(
                 log_warn(f"Skipping table at {t.get('root_oid')}: {e}")
                 continue
 
-            items.extend(masters)
+            for m in masters:
+                append_unique_item(items, m, used_item_keys, context="item")
             discovery_rules.append(dr)
             table_count += 1
             lld_count += 1
