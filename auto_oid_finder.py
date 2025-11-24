@@ -3,7 +3,7 @@
 auto_oid_finder.py
 ==================
 
-Version: 1.0.12
+Version: 1.0.13
 
 Changelog (short)
 -----------------
@@ -22,6 +22,9 @@ Changelog (short)
          enrichment with a fallback call for MODULE::name.
 1.0.12: Added forced LLD table building for all lld.include_roots (only if
          there are at least 2 rows), and unified column detection logic.
+1.0.13: If walking .1.3.6.1.4.1 fails, automatically walk each lld.include_roots
+         subtree under .1.3.6.1.4.1 individually so vendor tables (QNAP, etc.)
+         are still discovered.
 
 Purpose
 -------
@@ -38,6 +41,8 @@ Key ideas
     * .1.3.6.1.2.1   (MIB-2)
     * .1.3.6.1.4.1   (enterprise/vendor subtree)
   plus any extra roots passed with --root.
+- If the full .1.3.6.1.4.1 walk fails, we fall back to walking each
+  lld.include_roots subtree under .1.3.6.1.4.1 individually.
 - Classify OIDs into:
     * scalars: OIDs ending in ".0"
     * tables:  clusters of OIDs that look like SNMP tables
@@ -50,37 +55,6 @@ Key ideas
     * detect columns and enrich via snmptranslate
     * also **force-create tables** for each lld.include_roots that has at
       least 2 rows of data.
-
-Filters
--------
-
-Filtering is **100% driven by the filter file** (no legacy regex anymore).
-
-  --filter-file filters.yaml   (required)
-
-filters.yaml must contain (strict):
-
-    Version: 1.0
-
-    mib2:
-      regex: >
-        (sysDescr|sysObjectID|sysName|sysLocation|sysContact|...)
-
-    vendor:
-      regex: >
-        (temp|fan|cpu|memory|disk|status|...)
-
-    lld:
-      include_roots:
-        - ".1.3.6.1.2.1.2.2"          # ifTable
-        - ".1.3.6.1.2.1.31.1.1"       # ifXTable
-        - ".1.3.6.1.4.1.24681.1.2.11" # QNAP disk table (example)
-      exclude_roots:
-        - ".1.3.6.1.2.1.1.9"          # sysORTable
-        - ".1.3.6.1.2.1.4.21"         # ipRouteTable
-        - ".1.3.6.1.2.1.4.24"         # ipCidrRouteTable
-      regex: >
-        (ifHCInOctets|ifHCOutOctets|HdTemperature|HdCapacity|SysVolume...)
 """
 
 import argparse
@@ -94,7 +68,7 @@ from datetime import datetime, timezone
 
 import yaml
 
-VERSION = "1.0.12"
+VERSION = "1.0.13"
 
 MIB2_ROOT = ".1.3.6.1.2.1"
 VENDOR_ROOT = ".1.3.6.1.4.1"
@@ -286,11 +260,15 @@ def run_snmpwalk(
     port: int,
     timeout: int,
     retries: int,
+    suppress_errors: bool = False,
 ) -> list[tuple[str, str, str]]:
     """
     Run net-snmp snmpwalk and return a list of (oid, type, value).
 
     We always request numeric OIDs (-On).
+
+    If suppress_errors=True, CalledProcessError will be logged as [warn]
+    and an empty list returned instead of [error].
     """
     cmd = [
         "snmpwalk",
@@ -312,8 +290,12 @@ def run_snmpwalk(
         out_bytes = subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
         out = out_bytes.decode("utf-8", errors="replace")
     except subprocess.CalledProcessError as e:
-        log_error(f"snmpwalk failed: {e}")
-        return []
+        if suppress_errors:
+            log_warn(f"snmpwalk failed for {root_oid}: {e}")
+            return []
+        else:
+            log_error(f"snmpwalk failed: {e}")
+            return []
     except FileNotFoundError:
         log_error("snmpwalk not found in PATH. Install net-snmp tools.")
         return []
@@ -700,10 +682,59 @@ def build_profile(
       - forced tables for every lld.include_roots (if rows >= 2)
     """
     all_results: list[tuple[str, str, str]] = []
+    vendor_root_failed = False
+
+    # First, walk the main roots (.1.3.6.1.2.1 and .1.3.6.1.4.1 plus extras)
     for root in roots:
-        res = run_snmpwalk(host, community, root, port, timeout, retries)
+        # Only the vendor root can be "soft-failed" but we still want to
+        # detect that failure so we can later try narrower include_roots.
+        suppress = (root == VENDOR_ROOT)
+        res = run_snmpwalk(
+            host,
+            community,
+            root,
+            port,
+            timeout,
+            retries,
+            suppress_errors=suppress,
+        )
+        if not res and root == VENDOR_ROOT:
+            vendor_root_failed = True
+            log_warn(
+                "Vendor root walk (.1.3.6.1.4.1) returned no data; "
+                "will attempt dedicated walks for each lld.include_roots "
+                "subtree under .1.3.6.1.4.1."
+            )
         all_results.extend(res)
 
+    # If vendor root walk failed, try each include_roots subtree under .1.3.6.1.4.1
+    if vendor_root_failed:
+        for inc_root in lld_include_roots:
+            if not inc_root.startswith(VENDOR_ROOT + "."):
+                continue
+            # Only walk if we don't already have data under this subtree
+            already_have = any(
+                oid == inc_root or oid.startswith(inc_root + ".")
+                for oid, _, _ in all_results
+            )
+            if already_have:
+                continue
+            log_info(
+                f"Attempting dedicated vendor walk for LLD include root {inc_root} "
+                "because .1.3.6.1.4.1 walk failed."
+            )
+            sub_res = run_snmpwalk(
+                host,
+                community,
+                inc_root,
+                port,
+                timeout,
+                retries,
+                suppress_errors=True,
+            )
+            all_results.extend(sub_res)
+
+    # Build final map of all OIDs
     all_oids: dict[str, dict] = {}
     for oid, t, v in all_results:
         all_oids[oid] = {
@@ -825,7 +856,9 @@ def main():
             "Discover interesting scalar and table-like SNMP OIDs on a device "
             "and write a YAML profile suitable for oid2zabbix-template.py.\n"
             "Filtering is entirely driven by --filter-file (mib2/vendor/lld).\n"
-            "Always walks .1.3.6.1.2.1 and .1.3.6.1.4.1 plus any extra --root."
+            "Always walks .1.3.6.1.2.1 and .1.3.6.1.4.1 plus any extra --root.\n"
+            "If the .1.3.6.1.4.1 walk fails, each lld.include_roots subtree "
+            "under .1.3.6.1.4.1 is walked individually."
         )
     )
     parser.add_argument("--host", help="SNMP target host/IP")

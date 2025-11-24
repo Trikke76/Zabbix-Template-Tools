@@ -22,11 +22,18 @@ Tables:
   - master item:
       key:      snmp.raw.walk[<root_oid_compact>]
       snmp_oid: walk[.root_oid]
+      name:     RAW SNMP walk for <friendly table label>
+                (derived from MIB column, e.g. IF-MIB::ifDescr table (...))
   - discovery rule:
-      key: auto.discovery[<root_oid_compact>]
+      key:      auto.discovery[<root_oid_compact>]
+      name:     Auto LLD for <friendly table label>
   - item prototypes:
       key:      <MIB-name>_<oid_tail>[{#SNMPINDEX}]
       snmp_oid: get[.prefix.{#SNMPINDEX}]
+
+Additional:
+  - Global dedup guard on Zabbix keys so we never emit two items or
+    prototypes with the same key (scalar vs LLD, or cross-tables).
 """
 
 import argparse
@@ -71,33 +78,6 @@ def log_error(msg: str):
 def log_debug(msg: str):
     if DEBUG:
         print(f"[debug] {msg}")
-
-
-# ---------------------------------------------------------------------------
-# Dedup helpers for item keys
-# ---------------------------------------------------------------------------
-
-def append_unique_item(target_list, item_dict, used_keys: set, context: str = "item"):
-    """
-    Append an item dict to target_list, but only if its key is not already used.
-
-    - target_list: the list (items or item_prototypes) to append to
-    - item_dict: the Zabbix item dict (must have 'key' or 'key_')
-    - used_keys: a set() tracking keys we've already emitted
-    - context: 'item' or 'prototype' (for warning messages only)
-    """
-    key = item_dict.get("key") or item_dict.get("key_")
-    if not key:
-        # No key? Just append, nothing to dedup on.
-        target_list.append(item_dict)
-        return
-
-    if key in used_keys:
-        log_warn(f"Skipping duplicate {context} key: {key}")
-        return
-
-    used_keys.add(key)
-    target_list.append(item_dict)
 
 
 # ---------------------------------------------------------------------------
@@ -287,7 +267,32 @@ def make_scalar_item(entry: dict) -> dict:
     return item
 
 
-def make_table_lld(table: dict, used_proto_keys: set[str]) -> tuple[list[dict], dict]:
+def _friendly_table_label(root_oid: str, columns: list[dict]) -> str:
+    """
+    Build a human-friendly label for a table from its columns.
+
+    Preference:
+      1) First column with module+name -> "MODULE::name table (OID)"
+      2) First column with name        -> "name table (OID)"
+      3) Fallback                      -> "SNMP table OID"
+    """
+    label = None
+    for col in columns:
+        module = col.get("module")
+        name = col.get("name")
+        if module and name:
+            label = f"{module}::{name} table"
+            break
+        if name:
+            label = f"{name} table"
+            break
+
+    if label:
+        return f"{label} ({root_oid})"
+    return f"SNMP table {root_oid}"
+
+
+def make_table_lld(table: dict) -> tuple[list[dict], dict]:
     """
     Build master SNMP walk item + discovery rule for a given table entry.
 
@@ -307,6 +312,9 @@ def make_table_lld(table: dict, used_proto_keys: set[str]) -> tuple[list[dict], 
     approx_cols = table.get("approx_columns", 0)
     example_oids = table.get("example_oids") or []
     columns = table.get("columns") or []
+
+    # Build a friendly label for UI names
+    table_label = _friendly_table_label(root_oid, columns)
 
     # Safe root ID for discovery key
     safe_root = root_oid.lstrip(".").replace(".", "_")
@@ -328,7 +336,7 @@ def make_table_lld(table: dict, used_proto_keys: set[str]) -> tuple[list[dict], 
 
     master_item = {
         "uuid": uuid.uuid4().hex,
-        "name": f"RAW SNMP walk {root_oid}",
+        "name": f"RAW SNMP walk for {table_label}",
         "type": "SNMP_AGENT",
         "snmp_oid": walk_expr,
         "key": master_key,
@@ -342,41 +350,9 @@ def make_table_lld(table: dict, used_proto_keys: set[str]) -> tuple[list[dict], 
         ],
     }
 
-    # JavaScript pre-processing to turn raw snmpwalk text into LLD JSON
-    js_lld = """\
-var lines = value.split('\\n');
-var idxMap = {};
-for (var i = 0; i < lines.length; i++) {
-    var line = lines[i].trim();
-    if (!line || line.indexOf('=') === -1) continue;
-
-    // capture OID part: .1.3.6.1.4.1.x.x.x
-    var m = line.match(/^(\\.[0-9.]+)\\s+=/);
-    if (!m) continue;
-
-    var oid = m[1];
-    var parts = oid.split('.');
-    if (parts.length < 2) continue;
-
-    var idx = parts[parts.length - 1];
-    if (!idx) continue;
-
-    idxMap[idx] = true;
-}
-
-var data = [];
-for (var k in idxMap) {
-    if (idxMap.hasOwnProperty(k)) {
-        data.push({ "{#SNMPINDEX}": k });
-    }
-}
-
-return JSON.stringify({ "data": data });
-"""
-
     dr = {
         "uuid": uuid.uuid4().hex,
-        "name": f"Auto LLD for {root_oid}",
+        "name": f"Auto LLD for {table_label}",
         "type": "DEPENDENT",
         "key": discovery_key,
         "delay": DEFAULT_DISCOVERY_DELAY,
@@ -384,13 +360,9 @@ return JSON.stringify({ "data": data });
         "description": desc,
         "preprocessing": [
             {
-                "type": "JAVASCRIPT",
-                "parameters": [js_lld],
-            },
-            {
                 "type": "DISCARD_UNCHANGED_HEARTBEAT",
                 "parameters": ["1h"],
-            },
+            }
         ],
         "item_prototypes": [],
         "trigger_prototypes": [],
@@ -412,9 +384,7 @@ return JSON.stringify({ "data": data });
         elif name:
             proto_name = name
         else:
-            # Fallback: avoid using a raw OID as the UI name
-            last_arc = prefix.split(".")[-1] if prefix else "col"
-            proto_name = f"col_{last_arc}"
+            proto_name = prefix
 
         col_snmp_oid = f"{prefix}.{{#SNMPINDEX}}"
         proto_key = build_column_key(col, root_oid)
@@ -445,7 +415,7 @@ return JSON.stringify({ "data": data });
         if full_desc:
             proto["description"] = full_desc
 
-        append_unique_item(dr["item_prototypes"], proto, used_proto_keys, context="prototype")
+        dr["item_prototypes"].append(proto)
 
     return [master_item], dr
 
@@ -477,6 +447,10 @@ def build_zabbix_template(
         item for the same data.
       - By default, we only export scalars where entry['selected'] is True.
         Use all_scalars=True to ignore that flag and export everything.
+      - We enforce global uniqueness of item keys across:
+          * scalar items
+          * table master items
+          * LLD item prototypes
     """
     scalars = profile.get("scalars") or []
     tables = profile.get("tables") or []
@@ -484,9 +458,8 @@ def build_zabbix_template(
     items: list[dict] = []
     discovery_rules: list[dict] = []
 
-    # Track keys to avoid duplicates across the whole template
-    used_item_keys: set[str] = set()
-    used_proto_keys: set[str] = set()
+    # Global set of used Zabbix keys
+    used_keys: set[str] = set()
 
     # Collect table roots (normalized)
     table_roots = []
@@ -535,7 +508,18 @@ def build_zabbix_template(
             except Exception as e:
                 log_warn(f"Skipping scalar {s.get('oid')}: {e}")
                 continue
-            append_unique_item(items, item, used_item_keys, context="item")
+
+            k = item.get("key")
+            if k and k in used_keys:
+                log_warn(
+                    f"Skipping scalar {oid} because key '{k}' "
+                    f"is already used by another item"
+                )
+                continue
+
+            if k:
+                used_keys.add(k)
+            items.append(item)
             scalar_count += 1
 
     table_count = 0
@@ -548,16 +532,48 @@ def build_zabbix_template(
                 continue
 
             try:
-                masters, dr = make_table_lld(t, used_proto_keys)
+                masters, dr = make_table_lld(t)
             except Exception as e:
                 log_warn(f"Skipping table at {t.get('root_oid')}: {e}")
                 continue
 
+            # Dedup for master items
+            real_masters: list[dict] = []
             for m in masters:
-                append_unique_item(items, m, used_item_keys, context="item")
+                mk = m.get("key")
+                if mk and mk in used_keys:
+                    log_warn(
+                        f"Skipping master item for table {t.get('root_oid')}: "
+                        f"duplicate key '{mk}'"
+                    )
+                    continue
+                if mk:
+                    used_keys.add(mk)
+                real_masters.append(m)
+
+            items.extend(real_masters)
+
+            # Dedup for item prototypes
+            prototypes = dr.get("item_prototypes") or []
+            real_protos: list[dict] = []
+            for p in prototypes:
+                pk = p.get("key")
+                if pk and pk in used_keys:
+                    log_warn(
+                        f"Skipping item prototype for table {t.get('root_oid')}: "
+                        f"duplicate key '{pk}'"
+                    )
+                    continue
+                if pk:
+                    used_keys.add(pk)
+                real_protos.append(p)
+
+            dr["item_prototypes"] = real_protos
+
             discovery_rules.append(dr)
             table_count += 1
-            lld_count += 1
+            if real_protos:
+                lld_count += 1
 
     macros = [
         {
@@ -621,7 +637,9 @@ def main():
             "snmp_oid = get[prefix.{#SNMPINDEX}], key = MIBname_OIDtail[{#SNMPINDEX}].\n"
             "Scalars under table roots are NOT exported as regular items.\n"
             "By default, only scalars with selected=true are exported; use "
-            "--all-scalars to include every scalar."
+            "--all-scalars to include every scalar.\n"
+            "Master items and LLD prototypes are named using MIB info to be "
+            "more human-friendly than raw OIDs."
         )
     )
     parser.add_argument(
@@ -696,7 +714,7 @@ def main():
 
     pre_args, _ = parser.parse_known_args()
     if pre_args.version:
-        print(f"oid2zabbix-template.py version {VERSION}")
+        print(f"oid2zabbix-template.py version: {VERSION}")
         sys.exit(0)
 
     args = parser.parse_args()
