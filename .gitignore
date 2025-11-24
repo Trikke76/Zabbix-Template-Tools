@@ -3,3 +3,4 @@ observium_mibs/
 mibs/
 export_template/
 export_yaml/
+.DS_Store

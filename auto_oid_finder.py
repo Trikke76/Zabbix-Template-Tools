@@ -3,7 +3,7 @@
 auto_oid_finder.py
 ==================
 
-Version: 1.0.10
+Version: 1.0.12
 
 Changelog (short)
 -----------------
@@ -17,8 +17,11 @@ Changelog (short)
 1.0.7 : First pass at LLD table detection and filtering.
 1.0.8 : Introduced snmptranslate caching and more reliable name extraction.
 1.0.9 : The lost version (never made it out of the lab).
-1.0.10: Cleaned up legacy filters, made --filter-file mandatory and strict,
-         simplified selection logic, and kept only filter-file–driven behaviour.
+1.0.10: Cleaned up legacy filters, made --filter-file mandatory and strict.
+1.0.11: Always walk .1.3.6.1.2.1 and .1.3.6.1.4.1, improved snmptranslate
+         enrichment with a fallback call for MODULE::name.
+1.0.12: Added forced LLD table building for all lld.include_roots (only if
+         there are at least 2 rows), and unified column detection logic.
 
 Purpose
 -------
@@ -31,7 +34,10 @@ oid2zabbix-template.py to build a Zabbix 7.0 template.
 Key ideas
 ---------
 
-- Use one or more root OIDs (default: .1.3.6.1.2.1) and walk them via SNMP.
+- Always walk:
+    * .1.3.6.1.2.1   (MIB-2)
+    * .1.3.6.1.4.1   (enterprise/vendor subtree)
+  plus any extra roots passed with --root.
 - Classify OIDs into:
     * scalars: OIDs ending in ".0"
     * tables:  clusters of OIDs that look like SNMP tables
@@ -42,7 +48,8 @@ Key ideas
 - For each table:
     * detect approximate row/column counts
     * detect columns and enrich via snmptranslate
-    * only keep "interesting" tables based on LLD filters.
+    * also **force-create tables** for each lld.include_roots that has at
+      least 2 rows of data.
 
 Filters
 -------
@@ -67,7 +74,7 @@ filters.yaml must contain (strict):
       include_roots:
         - ".1.3.6.1.2.1.2.2"          # ifTable
         - ".1.3.6.1.2.1.31.1.1"       # ifXTable
-        - ".1.3.6.1.4.1.24681"        # QNAP (example)
+        - ".1.3.6.1.4.1.24681.1.2.11" # QNAP disk table (example)
       exclude_roots:
         - ".1.3.6.1.2.1.1.9"          # sysORTable
         - ".1.3.6.1.2.1.4.21"         # ipRouteTable
@@ -87,9 +94,11 @@ from datetime import datetime, timezone
 
 import yaml
 
-VERSION = "1.0.10"
+VERSION = "1.0.12"
 
-DEFAULT_ROOT = ".1.3.6.1.2.1"  # MIB-2
+MIB2_ROOT = ".1.3.6.1.2.1"
+VENDOR_ROOT = ".1.3.6.1.4.1"
+
 DEFAULT_COMMUNITY = "public"
 DEFAULT_PORT = 161
 DEFAULT_TIMEOUT = 2
@@ -189,8 +198,10 @@ def snmptranslate_enrich(
     """
     Use snmptranslate to try to get (module, name, description) for a numeric OID.
 
-    Results are cached in SNMPTRANSLATE_CACHE so repeated lookups
-    don't spawn extra snmptranslate processes.
+    Strategy:
+      - First call: snmptranslate -m +ALL -Td <oid>   (for DESCRIPTION, maybe name)
+      - If module/name still missing: snmptranslate -m +ALL <oid>  (MODULE::name)
+      - Cache the final (module, name, desc) in SNMPTRANSLATE_CACHE.
     """
     if not oid:
         return None, None, None
@@ -199,42 +210,65 @@ def snmptranslate_enrich(
     if cached is not None:
         return cached
 
-    cmd = ["snmptranslate", "-m", "+ALL", "-Td", oid]
     env = os.environ.copy()
-
     if observium_dir:
         mibdirs = observium_dir
         if env.get("MIBDIRS"):
             mibdirs = observium_dir + os.pathsep + env["MIBDIRS"]
         env["MIBDIRS"] = mibdirs
 
-    log_debug(f"snmptranslate cmd: {' '.join(cmd)}")
-    try:
-        out = subprocess.check_output(
-            cmd, env=env, stderr=subprocess.DEVNULL, text=True
-        )
-    except Exception:
-        result = (None, None, None)
-        SNMPTRANSLATE_CACHE[oid] = result
-        return result
-
     module = None
     name = None
     desc = None
 
-    # Typical line: "SNMPv2-MIB::sysDescr OBJECT-TYPE"
-    for line in out.splitlines():
-        line = line.strip()
-        if "::" in line and "OBJECT-TYPE" in line:
-            m = re.match(r"^([A-Za-z0-9\-]+)::([A-Za-z0-9_\-]+)\s+OBJECT-TYPE", line)
-            if m:
-                module, name = m.group(1), m.group(2)
-                break
+    # First pass: -Td (detailed)
+    cmd_td = ["snmptranslate", "-m", "+ALL", "-Td", oid]
+    log_debug(f"snmptranslate (Td) cmd: {' '.join(cmd_td)}")
+    try:
+        out_td = subprocess.check_output(
+            cmd_td,
+            env=env,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except Exception:
+        out_td = ""
 
-    # Description parsing: coarse but safe
-    m_desc = re.search(r'DESCRIPTION\s+"([^"]*)"', out, re.DOTALL)
-    if m_desc:
-        desc = m_desc.group(1).replace("\n", " ").strip()
+    if out_td:
+        # Typical line: "SNMPv2-MIB::sysDescr OBJECT-TYPE"
+        for line in out_td.splitlines():
+            line = line.strip()
+            if "::" in line and "OBJECT-TYPE" in line:
+                m = re.match(r"^([A-Za-z0-9\-]+)::([A-Za-z0-9_\-]+)\s+OBJECT-TYPE", line)
+                if m:
+                    module, name = m.group(1), m.group(2)
+                    break
+
+        m_desc = re.search(r'DESCRIPTION\s+"([^"]*)"', out_td, re.DOTALL)
+        if m_desc:
+            desc = m_desc.group(1).replace("\n", " ").strip()
+
+    # Second pass: simple translate if module/name still missing
+    if module is None or name is None:
+        cmd_simple = ["snmptranslate", "-m", "+ALL", oid]
+        log_debug(f"snmptranslate (simple) cmd: {' '.join(cmd_simple)}")
+        try:
+            out_simple = subprocess.check_output(
+                cmd_simple,
+                env=env,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+            first = out_simple.strip().splitlines()[0].strip()
+            if "::" in first:
+                m2 = re.match(r"^([A-Za-z0-9\-]+)::([A-Za-z0-9_\-]+)", first)
+                if m2:
+                    if module is None:
+                        module = m2.group(1)
+                    if name is None:
+                        name = m2.group(2)
+        except Exception:
+            pass
 
     result = (module, name, desc)
     SNMPTRANSLATE_CACHE[oid] = result
@@ -459,6 +493,12 @@ def derive_table_columns(
     column prefixes and enrich them via snmptranslate.
 
     all_oids[oid] = { "type": ..., "value": ... }
+
+    Column detection rule:
+      - For each OID under root, column prefix is everything except the last
+        index component:
+          <root>.<...column...>.<index>
+        => prefix = <root>.<...column...>
     """
     root = table["root_oid"]
     root_parts = split_oid(root)
@@ -553,6 +593,69 @@ def table_is_interesting(
     return False
 
 
+def build_forced_table_for_root(
+    root: str,
+    all_oids: dict[str, dict],
+    observium_dir: str | None,
+    min_rows: int = 2,
+) -> dict | None:
+    """
+    Build a table entry "forced" for a given root (lld.include_roots).
+
+    - Anchors directly at 'root' (e.g. .1.3.6.1.4.1.24681.1.2.11).
+    - Only returns a table if there are at least 'min_rows' distinct indexes.
+    - Column detection uses the same "immediate prefix before index" rule.
+    """
+    oids_under_root = [
+        oid for oid in all_oids.keys()
+        if oid == root or oid.startswith(root + ".")
+    ]
+    if not oids_under_root:
+        log_debug(f"Forced LLD root {root}: no OIDs found under this subtree")
+        return None
+
+    root_parts = split_oid(root)
+    row_indices = set()
+
+    for oid in oids_under_root:
+        parts = split_oid(oid)
+        if len(parts) <= len(root_parts):
+            continue
+        tail = parts[len(root_parts):]
+        if not tail:
+            continue
+        idx = tail[-1]
+        row_indices.add(idx)
+
+    approx_rows = len(row_indices)
+    if approx_rows < min_rows:
+        log_debug(
+            f"Forced LLD root {root}: only {approx_rows} rows found; "
+            f"min_rows={min_rows}, skipping"
+        )
+        return None
+
+    # Use the same column detection/enrichment as normal tables
+    base_table = {
+        "root_oid": root,
+        "approx_rows": approx_rows,
+        "approx_columns": 0,
+        "example_oids": sorted(oids_under_root)[:5],
+    }
+    columns = derive_table_columns(base_table, all_oids, observium_dir)
+    if not columns:
+        log_debug(f"Forced LLD root {root}: no columns derived, skipping")
+        return None
+
+    base_table["approx_columns"] = len(columns)
+    base_table["columns"] = columns
+    log_debug(
+        f"Forced LLD root {root}: rows={approx_rows}, columns={len(columns)}, "
+        f"examples={len(base_table['example_oids'])}"
+    )
+    return base_table
+
+
 # ---------------------------------------------------------------------------
 # Main profile builder
 # ---------------------------------------------------------------------------
@@ -591,6 +694,10 @@ def build_profile(
     """
     Walk the given roots, collect OIDs, figure out scalars and tables,
     enrich with MIB names, and return (profile, stats).
+
+    Tables come from two sources:
+      - heuristic detection (detect_tables + LLD filters)
+      - forced tables for every lld.include_roots (if rows >= 2)
     """
     all_results: list[tuple[str, str, str]] = []
     for root in roots:
@@ -616,12 +723,11 @@ def build_profile(
 
         module, name, desc = snmptranslate_enrich(oid, observium_dir)
 
-        if oid.startswith(".1.3.6.1.2.1."):
+        if oid.startswith(MIB2_ROOT + "."):
             active_re = mib2_filter_re
-        elif oid.startswith(".1.3.6.1.4.1."):
+        elif oid.startswith(VENDOR_ROOT + "."):
             active_re = vendor_filter_re
         else:
-            # fallback: if vendor covers it, use vendor; otherwise mib2
             active_re = vendor_filter_re or mib2_filter_re
 
         selected = decide_scalar_selected(
@@ -645,9 +751,9 @@ def build_profile(
             }
         )
 
-    # Tables
+    # Tables: first from heuristic detection + filtering
     tables_meta = detect_tables(list(all_oids.keys()))
-    tables: list[dict] = []
+    tables_by_root: dict[str, dict] = {}
 
     for t in tables_meta:
         cols = derive_table_columns(t, all_oids, observium_dir)
@@ -666,7 +772,23 @@ def build_profile(
 
         t_with_cols = dict(t)
         t_with_cols["columns"] = cols
-        tables.append(t_with_cols)
+        tables_by_root[t["root_oid"]] = t_with_cols
+
+    # Forced tables for every lld.include_roots (only if rows >= 2)
+    for forced_root in lld_include_roots:
+        if forced_root in tables_by_root:
+            continue
+        forced_table = build_forced_table_for_root(
+            forced_root,
+            all_oids,
+            observium_dir,
+            min_rows=2,
+        )
+        if forced_table is not None:
+            log_debug(f"Forced LLD table added for root {forced_root}")
+            tables_by_root[forced_root] = forced_table
+
+    tables = list(tables_by_root.values())
 
     profile = {
         "version": "auto_oid_profile_v1",
@@ -702,7 +824,8 @@ def main():
         description=(
             "Discover interesting scalar and table-like SNMP OIDs on a device "
             "and write a YAML profile suitable for oid2zabbix-template.py.\n"
-            "Filtering is entirely driven by --filter-file (mib2/vendor/lld)."
+            "Filtering is entirely driven by --filter-file (mib2/vendor/lld).\n"
+            "Always walks .1.3.6.1.2.1 and .1.3.6.1.4.1 plus any extra --root."
         )
     )
     parser.add_argument("--host", help="SNMP target host/IP")
@@ -721,8 +844,8 @@ def main():
         "--root",
         action="append",
         help=(
-            "Root OID to walk (numeric). Can be used multiple times. "
-            f"Default: {DEFAULT_ROOT}"
+            "Additional root OID to walk (numeric). "
+            "Script always walks .1.3.6.1.2.1 and .1.3.6.1.4.1 by default."
         ),
     )
     parser.add_argument(
@@ -784,7 +907,13 @@ def main():
     DEBUG = args.debug
     log_info(f"auto_oid_finder.py version: {VERSION}")
 
-    roots = args.root or [DEFAULT_ROOT]
+    # Always walk these two, plus any extra --root
+    roots = [MIB2_ROOT, VENDOR_ROOT]
+    extra_roots = args.root or []
+    for r in extra_roots:
+        if r not in roots:
+            roots.append(r)
+    log_info(f"Effective roots to walk: {', '.join(roots)}")
 
     # ------------------------------------------------------------------
     # Load and validate filters.yaml (STRICT)
@@ -842,7 +971,7 @@ def main():
         vendor_filter_re = re.compile(vendor_cfg["regex"], re.IGNORECASE | re.VERBOSE)
         log_info(f"Vendor filter regex: '{vendor_cfg['regex']}'")
     except re.error as e:
-        log_error(f"Invalid vendor filter regex: {e}")
+        log_error(f"Invalid Vendor filter regex: {e}")
         sys.exit(1)
 
     try:

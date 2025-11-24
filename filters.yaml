@@ -70,6 +70,21 @@ lld:
     - ".1.3.6.1.2.1.4.24"         # ipCidrRouteTable
     - ".1.3.6.1.2.1.4.22"         # arpTable
     - ".1.3.6.1.2.1.6.13"         # tcpConnectionTable
+    - ".1.3.6.1.2.1.25.3.2.1"     # hrDeviceTable (index only)
+    - ".1.3.6.1.2.1.25.2.3"       # hrStorageTable (mixed index, not useful via LLD)
+    - ".1.3.6.1.2.1.25.6.3"       # hrSWRunTable (process list)
+    - ".1.3.6.1.2.1.25.6.5"       # hrSWInstalledTable (installed software)
+    - ".1.3.6.1.2.1.1.9"          # sysORTable
+    - ".1.3.6.1.2.1.4.21"         # ipRouteTable
+    - ".1.3.6.1.2.1.4.22"         # ipNetToMediaTable (ARP)
+    - ".1.3.6.1.2.1.4.24"         # ipCidrRouteTable
+    - ".1.3.6.1.2.1.4.25"         # ipForwardTable
+    - ".1.3.6.1.2.1.31.1.2"       # ifStackTable
+    - ".1.3.6.1.4.1.9.2.1"        # cpmCPUTotalTable alias roots (CPU index only)
+    - ".1.3.6.1.4.1.9.9.96"       # CISCO-CONFIG-COPY-MIB (jobs list)
+    - ".1.3.6.1.4.1.9.9.115"      # CISCO-FLASH-MIB (file inventory)
+    - ".1.3.6.1.4.1.8072.1.4"     # nsTable / nsModuleTable directory
+
 
   # Columns that decide if a table is "useful"
   regex: >
