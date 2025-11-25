@@ -1,225 +1,351 @@
-# SNMP Auto OID Finder & Zabbix Template Builder
+# 🚀 SNMP Auto OID Finder & Zabbix Template Builder
+
 Smart, automated SNMP discovery and Zabbix 7.0 template generation.
 
-This project consists of two tightly-coupled tools:
+This project consists of four integrated tools:
 
-• **auto_oid_finder.py**  
-  Scans a device via SNMP, discovers useful scalar OIDs and table structures,  
-  enriches them with MIB names, applies filters, and outputs a compact YAML profile.
-
-• **oid2zabbix-template.py**  
-  Converts the YAML profile into a clean, deduplicated Zabbix 7.0 template with:  
-  - Scalar items  
-  - LLD discovery rules  
-  - Item prototypes  
-  - Proper async-SNMP keys (get[] / walk[])  
-  - Preprocessing  
-  - Clean naming and vendor metadata
-
-Together, these tools automate SNMP monitoring for NAS devices, switches, routers, UPS units, servers, firewalls, printers, and more.
+- auto_oid_finder.py — Smart SNMP scanner and YAML profile generator
+- oid2zabbix-template.py — Zabbix 7 template builder
+- fixmymib.py — Vendor MIB fixer/normalizer
+- mib2oid.py — MIB → OID extractor
 
 ---
 
-## REQUIRED PYTHON PACKAGES
+## 📦 Requirements
 
-Install via pip:
+Python packages:
 
-```
-pip install pysnmp pyyaml rich lxml
-```
+    pip install pyyaml rich lxml
 
-Optional (recommended for MIB enrichment):
+Optional (recommended):
 
-```
-pip install pysmi
-```
+    pip install pysmi
 
-Required system tools:
-- `snmpwalk`, `snmptranslate` from **net-snmp**
-- (Optional) Observium MIB repository
+System tools:
 
----
+- snmpwalk
+- snmptranslate
+  (from net-snmp)
 
-## COMMAND-LINE OPTIONS
+Optional:
 
-### auto_oid_finder.py — SNMP Scanner + Profile Generator
-
-```
-usage: auto_oid_finder.py [options]
-
-Options:
-  --host <IP/FQDN>            Target device
-  --community <string>        SNMP community (v2c)
-  --version <1|2c|3>          SNMP version (default: 2c)
-
-SNMPv3:
-  --v3-user <name>
-  --v3-auth-proto <MD5|SHA|SHA256|SHA512>
-  --v3-auth-pass <password>
-  --v3-priv-proto <DES|AES|AES192|AES256>
-  --v3-priv-pass <password>
-
-Discovery:
-  --root <OID>                Additional OID roots to walk (repeatable)
-  --filter-file <file>        YAML filtering rules
-  --timeout <seconds>         SNMP timeout (default: 2)
-  --retries <n>               SNMP retries (default: 2)
-
-Output:
-  --output-dir <dir>          Directory for YAML profiles (default: export_yaml/)
-  --tag <string>              Add metadata tag to output filename
-
-Misc:
-  --disable-mib               Skip MIB name resolution
-  --debug                     Enable verbose debugging
-```
+- Observium MIB repository (auto-managed in ./observium_mibs)
 
 ---
 
-### oid2zabbix-template.py — Zabbix 7 Template Builder
+## 📁 Directory Structure
 
-```
-usage: oid2zabbix-template.py <yaml-profile> [options]
+    auto_oid_finder.py               # SNMP scanner
+    oid2zabbix-template.py           # Template builder
+    fixmymib.py                      # MIB fixer
+    mib2oid.py                       # MIB → OID extractor
 
-Options:
-  --name <template name>      Name of the Zabbix template
-  --vendor <string>           Vendor override
-  --output-dir <dir>          Output directory (default: export_template/)
-  --prefix <string>           Prefix all item names
-  --tag <string>              Add template tag to all items
+    filters/                         # Device-specific scanner rules
+      filters.yaml                   # Generic filters
+      filters_qnap.yaml              # Example vendor filters
 
-Advanced:
-  --max-depth <n>             Limit table depth
-  --skip-lld                  Disable low-level discovery rules
-  --skip-scalars              Do not include scalar items
+    profiles/                        # Zabbix semantic profiles
+      profile_55062_QNAP.yaml
+      profile_24681_QNAP.yaml
 
-Debug:
-  --debug                     Enable verbose debugging
-```
+    export_yaml/                     # Scanner output
+    export_template/                 # Zabbix templates
+    observium_mibs/                  # Optional MIB repo (auto-managed)
 
 ---
 
-## QUICKSTART
+## 🛰️ auto_oid_finder.py — SNMP Scanner & Profile Generator
+
+auto_oid_finder.py scans a device via SNMP and generates a compact YAML profile with:
+
+- Discovered scalar OIDs
+- Detected SNMP tables
+- LLD-ready table metadata
+- Sample type/value information
+- MIB-enriched module/name/description (optional)
+- Selection flags based on filters
+
+### Command-line options
+
+    usage: auto_oid_finder.py [options]
+
+    Required:
+      --host <IP/FQDN>              Target device
+
+    SNMP:
+      --community <string>          SNMP v2c community
+      --port <port>                 SNMP port (default: 161)
+      --timeout <s>                 SNMP timeout (default: 2)
+      --retries <n>                 SNMP retries (default: 1)
+
+    Discovery:
+      --filter-file <yaml>          Filtering rules (default: filters/filters.yaml)
+      --root <OID>                  Extra OID root to walk (repeatable)
+      --no-filter                   Disable filters; select everything
+
+    Output:
+      --output <file>               Output YAML file
+      --no-observium                Disable Observium/MIB enrichment
+      --observium-sync              Force Observium MIB repo sync/update
+
+    Misc:
+      --debug                       Enable verbose debug logging
+      --version                     Show script version and exit
+
+### Behaviour (v1.0.15)
+
+Walk roots:
+
+- Always walks:
+  - .1.3.6.1.2.1 (MIB-2)
+- Additionally walks:
+  - Any lld.include_roots from the filter file that start with .1.3.6.1.4.1.
+    (e.g. .1.3.6.1.4.1.24681, .1.3.6.1.4.1.55062 for QNAP)
+  - Any extra roots passed via --root
+
+Important:
+
+- It no longer walks the entire .1.3.6.1.4.1 enterprises tree by default.
+- SNMP walks that partially succeed but end in a timeout still contribute their data.
+  - Partial results are kept and logged as warnings instead of hard errors.
+
+### Schema overview
+
+![auto-oid-finder.png](auto-oid-finder.png)
+
+### Sequence overview
+
+![sequence-diagram.png](sequence-diagram.png)
+
+---
+
+## 🧩 oid2zabbix-template.py — Zabbix Template Builder
+
+oid2zabbix-template.py reads the YAML profile generated by auto_oid_finder.py and converts it into a Zabbix 7.0 template:
+
+- Scalar items
+- LLD discovery rules
+- Item prototypes
+- Async SNMP keys (snmp.get[] / snmp.walk[])
+- Preprocessing chains
+- Vendor/metadata injection
+- Clean naming and deduplication
+
+### Command-line options
+
+    usage: oid2zabbix-template.py <profile.yaml> [options]
+
+    Options:
+      --name <template name>        Name of the Zabbix template
+      --vendor <string>             Vendor override
+      --prefix <string>             Prefix all item names
+      --output-dir <dir>            Output directory (default: export_template/)
+      --skip-lld                    Disable low-level discovery
+      --skip-scalars                Do not include scalar items
+      --debug                       Enable verbose debugging
+
+Profiles in profiles/ provide semantic hints:
+
+- profile_55062_QNAP.yaml
+- profile_24681_QNAP.yaml
+- etc.
+
+They map discovered OIDs to semantic groups such as disk, fan, temp, etc. per vendor or enterprise ID.
+
+---
+
+## 🛠️ fixmymib.py — MIB Repair Tool
+
+fixmymib.py is a helper for repairing and normalizing vendor MIB files so they can be loaded by net-snmp tools like snmptranslate.
+
+Typical problems it can help with:
+
+- Missing or broken "::= { parent X }" lines
+- Invalid or malformed OBJECT-TYPE definitions
+- Extra or missing braces
+- Non-standard tokens or formatting issues
+
+Example usage:
+
+    fixmymib.py some_vendor.mib
+    fixmymib.py some_vendor.mib --backup
+    fixmymib.py some_vendor.mib --output fixed_vendor.mib --normalize
+
+Typical options (may vary slightly depending on your current version):
+
+- --backup          Keep a .bak copy of the original file
+- --output <file>   Save the fixed MIB to a custom path
+- --strip-comments  Remove comments/garbage that break parsing
+- --normalize       Apply consistent formatting/indentation
+- --strict          Abort on unfixable syntax instead of guessing
+- --debug           Show detailed repair operations
+
+Use this when a vendor MIB refuses to load with snmptranslate or snmpwalk.
+
+---
+
+## 🔎 mib2oid.py — MIB → OID Extractor
+
+mib2oid.py parses a MIB file and prints the numeric OIDs for all defined objects, helping you quickly identify:
+
+- The enterprise root OID (e.g. .1.3.6.1.4.1.24681)
+- All OBJECT-TYPE, NOTIFICATION-TYPE, MODULE-IDENTITY OIDs
+- Subtrees relevant for filters or profiles
+
+Example usage:
+
+    mib2oid.py QNAP-NAS-MIB.mib
+    mib2oid.py QNAP-NAS-MIB.mib --numeric
+    mib2oid.py QNAP-NAS-MIB.mib --filter disk
+
+Typical options (may vary slightly):
+
+- --tree            Print a hierarchical view of the OID tree
+- --numeric         Output numeric OIDs only
+- --filter <regex>  Filter objects by name using a regex
+- --output <file>   Save results to a file
+- --debug           Verbose debug mode
+
+This is particularly useful when building:
+
+- filters/*.yaml (to know which roots to include)
+- profiles/*.yaml (to map OIDs into semantic groups like disk/fan/temp)
+
+---
+
+## ⚡ Quickstart
 
 ### 1) Install requirements
 
-```
-pip install pysnmp pyyaml rich lxml pysmi
-sudo apt install snmp snmp-mibs-downloader
-```
-
-### 2) Create filters.yaml
-
-```yaml
-mib2:
-  regex: "(sysUpTime|ifHCInOctets|ifHCOutOctets)"
-vendor:
-  regex: "(temp|fan|voltage)"
-lld:
-  regex: "(ifHCInOctets|temperature|voltage)"
-  include_roots:
-    - ".1.3.6.1.2.1.2.2"
-    - ".1.3.6.1.2.1.31.1.1"
-    - ".1.3.6.1.4.1.24681"
-  exclude_roots:
-    - ".1.3.6.1.2.1.4.21"
-    - ".1.3.6.1.2.1.25.3.2.1"
-```
-
-### 3) Run the OID Finder
-
-```
-./auto_oid_finder.py \
-    --host 192.168.0.107 \
-    --community public \
-    --filter-file filters.yaml
-```
-
-Output is stored under **export_yaml/**.
-
-### 4) Generate a Zabbix Template
-
-```
-./oid2zabbix-template.py \
-    export_yaml/auto_oid_192.168.0.107_*.yaml \
-    --name "Template SNMP Auto"
-```
-
-Final template appears in **export_template/**.
+    pip install pyyaml rich lxml pysmi
+    sudo apt install snmp
 
 ---
 
-## HOW IT WORKS
+### 2) Choose a filter file
 
-### 1. Smart SNMP Scanner
+Generic scanning:
 
-Walks:
-- `.1.3.6.1.2.1` (MIB-2)
-- `.1.3.6.1.4.1` (Vendor subtree)
-- Any additional roots via `--root`
+    filters/filters.yaml
 
-Features:
-- Discovers scalars and multi-index tables  
-- Resolves MIB names & descriptions  
-- Applies regex filters  
-- Skips useless tables (ARP, routing, TCP, HR-MIB noise)  
-- Produces a clean YAML profile  
+Vendor-specific example (QNAP):
+
+    filters/filters_qnap.yaml
+
+A typical QNAP filter file includes:
+
+- MIB-2 and vendor scalar regex patterns
+- LLD regex
+- LLD include_roots:
+  - .1.3.6.1.2.1.2.2
+  - .1.3.6.1.2.1.31.1.1
+  - .1.3.6.1.4.1.24681
+  - .1.3.6.1.4.1.55062
+- LLD exclude_roots:
+  - Routing, ARP, TCP connection tables
+  - HR-MIB junk tables
+  - QNAP directory-like index tables
+
+---
+
+### 3) Run the OID Finder
+
+Example (QNAP NAS):
+
+    ./auto_oid_finder.py \
+        --host 192.168.0.107 \
+        --community public \
+        --filter-file filters/filters_qnap.yaml
+
+You should see something like:
+
+    [info] LLD include_roots: .1.3.6.1.2.1.2.2, .1.3.6.1.2.1.31.1.1, .1.3.6.1.4.1.24681, .1.3.6.1.4.1.55062
+    [info] Effective roots to walk: .1.3.6.1.2.1, .1.3.6.1.4.1.24681, .1.3.6.1.4.1.55062
+
+Output YAML goes into export_yaml/, for example:
+
+    export_yaml/auto_oid_192.168.0.107_202511251146.yaml
+
+---
+
+### 4) Generate a Zabbix Template
+
+    ./oid2zabbix-template.py \
+        export_yaml/auto_oid_192.168.0.107_*.yaml \
+        --name "Template SNMP QNAP"
+
+Templates are saved under export_template/.
+
+---
+
+## 🧠 How It Works
+
+### 1. Smart SNMP Scanner (auto_oid_finder.py)
+
+- Walks:
+  - .1.3.6.1.2.1 (always)
+  - Vendor trees from lld.include_roots
+  - Optional extra --root subtrees
+- Discovers:
+  - Scalars (OIDs ending in .0)
+  - Tables (heuristic multi-index patterns)
+- Enriches:
+  - module/name/description via snmptranslate and optional Observium MIBs
+- Filters:
+  - Scalars using mib2.regex / vendor.regex
+  - Tables using lld.regex / lld.include_roots / lld.exclude_roots
+- Handles timeouts gracefully:
+  - Partial snmpwalk data is preserved and logged as warnings
 
 ---
 
 ### 2. LLD Table Engine
 
-For each SNMP table:
-- Generates master walk item  
-- Creates discovery rule  
-- Builds item prototypes  
-- Names columns from MIBs  
-- Applies include/exclude roots  
-- Supports regex-based table filtering  
+For each interesting table:
+
+- Determines approximate rows and columns
+- Derives column prefixes and data types
+- Applies LLD filters:
+  - include_roots (must-keep subtrees)
+  - exclude_roots (global junk)
+  - regex-based column filtering
 
 ---
 
-### 3. Template Builder
+### 3. Template Builder (oid2zabbix-template.py)
 
-Creates a complete Zabbix 7 template:
-- Async SNMP keys (get[] / walk[])  
-- Deduplicated items  
-- Preprocessing chains  
-- Vendor & metadata injection  
-- Clean and consistent naming  
-- Avoids scalar/table conflicts  
-
-![auto-oid-finder.png](auto-oid-finder.png)
----
-
-## PROJECT STRUCTURE
-
-```
-auto_oid_finder.py       # SNMP scanner + profile generator
-oid2zabbix-template.py   # Zabbix template generator
-filters.yaml             # Filtering rules
-export_yaml/             # Finder output
-export_template/         # Zabbix templates
-profiles/                # Optional saved profiles
-observium_mibs/          # Optional MIB repository
-```
+- Creates:
+  - Scalar items for selected scalars
+  - Discovery rules for interesting tables
+  - Item prototypes per table column
+- Ensures:
+  - Async SNMP keys (snmp.get[] / snmp.walk[])
+  - Deduplicated item names
+  - Table/scalar namespace separation
+  - Clean, vendor-aware naming
 
 ---
 
-## SUPPORTED DEVICES
+## 🖥️ Supported Devices (Examples)
 
-NAS: QNAP, Synology, TrueNAS, Netgear  
-Switches: Cisco, Juniper, HP, Aruba, Mikrotik  
-UPS/PDU: APC, Eaton  
-Servers: Linux, BSD, Windows SNMP  
-Printers: HP, Brother, Xerox  
-Firewalls, routers, IoT devices… anything with SNMP.
+- NAS: QNAP, Synology, TrueNAS, Netgear
+- Switches: Cisco, Juniper, HP, Aruba, Mikrotik
+- UPS/PDU: APC, Eaton
+- Servers: Linux, BSD, Windows SNMP
+- Printers: HP, Brother, Xerox
+- Firewalls, routers, IoT devices — anything with SNMP.
 
 ---
 
-## CONTRIBUTIONS
+## 🤝 Contributions
 
-Contributions for vendor-specific improvements, smarter filters, blocklists, and LLD patterns are welcome.  
-The goal: **the most complete SNMP automation toolkit for Zabbix.**
+Contributions are welcome:
 
+- New vendor-specific filters (filters_*.yaml)
+- New semantic profiles (profiles/*.yaml)
+- Improved regex patterns and LLD heuristics
+- Better MIB repair logic for fixmymib.py
+- Additional examples and documentation
+
+Goal: build the most complete automated SNMP → Zabbix toolkit.
 

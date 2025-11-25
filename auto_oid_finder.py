@@ -3,7 +3,7 @@
 auto_oid_finder.py
 ==================
 
-Version: 1.0.13
+Version: 1.0.15
 
 Changelog (short)
 -----------------
@@ -25,6 +25,9 @@ Changelog (short)
 1.0.13: If walking .1.3.6.1.4.1 fails, automatically walk each lld.include_roots
          subtree under .1.3.6.1.4.1 individually so vendor tables (QNAP, etc.)
          are still discovered.
+1.0.14: Stop walking .1.3.6.1.4.1 by default; you can add it or specific vendor
+         subtrees (e.g. .1.3.6.1.4.1.24681) via --root.
+1.0.15: Keep partial data when a walk gives timeout.
 
 Purpose
 -------
@@ -39,10 +42,11 @@ Key ideas
 
 - Always walk:
     * .1.3.6.1.2.1   (MIB-2)
-    * .1.3.6.1.4.1   (enterprise/vendor subtree)
-  plus any extra roots passed with --root.
-- If the full .1.3.6.1.4.1 walk fails, we fall back to walking each
-  lld.include_roots subtree under .1.3.6.1.4.1 individually.
+  plus any vendor roots derived from the profile (lld.include_roots) and
+  any extra roots passed via --root.
+- If .1.3.6.1.4.1 is explicitly added as a root and that walk fails, we fall
+  back to walking each lld.include_roots subtree under .1.3.6.1.4.1
+  individually.
 - Classify OIDs into:
     * scalars: OIDs ending in ".0"
     * tables:  clusters of OIDs that look like SNMP tables
@@ -68,7 +72,7 @@ from datetime import datetime, timezone
 
 import yaml
 
-VERSION = "1.0.13"
+VERSION = "1.0.15"
 
 MIB2_ROOT = ".1.3.6.1.2.1"
 VENDOR_ROOT = ".1.3.6.1.4.1"
@@ -252,7 +256,6 @@ def snmptranslate_enrich(
 # ---------------------------------------------------------------------------
 # SNMP walk via net-snmp snmpwalk
 # ---------------------------------------------------------------------------
-
 def run_snmpwalk(
     host: str,
     community: str,
@@ -267,8 +270,8 @@ def run_snmpwalk(
 
     We always request numeric OIDs (-On).
 
-    If suppress_errors=True, CalledProcessError will be logged as [warn]
-    and an empty list returned instead of [error].
+    If suppress_errors=True, non-zero exit codes are logged as [warn]
+    and we still keep any partial data that was returned (if any).
     """
     cmd = [
         "snmpwalk",
@@ -287,20 +290,75 @@ def run_snmpwalk(
     log_debug(" ".join(cmd))
 
     try:
-        out_bytes = subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
-        out = out_bytes.decode("utf-8", errors="replace")
-    except subprocess.CalledProcessError as e:
-        if suppress_errors:
-            log_warn(f"snmpwalk failed for {root_oid}: {e}")
-            return []
-        else:
-            log_error(f"snmpwalk failed: {e}")
-            return []
+        # Do NOT raise on non-zero exit codes; we want partial data.
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
     except FileNotFoundError:
         log_error("snmpwalk not found in PATH. Install net-snmp tools.")
         return []
 
+    out = proc.stdout.decode("utf-8", errors="replace")
+    err = proc.stderr.decode("utf-8", errors="replace").strip()
+
     results: list[tuple[str, str, str]] = []
+
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # Drop timeout / end-of-view messages from output
+        if line.startswith("Timeout:"):
+            continue
+        if "No more variables left in this MIB View" in line:
+            continue
+
+        if " = " not in line:
+            continue
+        oid_part, rest = line.split(" = ", 1)
+        oid_part = oid_part.strip()
+        rest = rest.strip()
+
+        if ":" in rest:
+            type_part, value_part = rest.split(":", 1)
+            type_part = type_part.strip()
+            value_part = value_part.strip()
+        else:
+            type_part = rest
+            value_part = ""
+
+        results.append((oid_part, type_part, value_part))
+
+    if proc.returncode != 0:
+        if results:
+            # Partial success: we got some useful data
+            msg = (
+                f"snmpwalk for {root_oid} on {host}:{port} "
+                f"returned exit code {proc.returncode} but produced "
+                f"{len(results)} OIDs; using partial data."
+            )
+            if suppress_errors:
+                log_warn(msg + (f" stderr={err}" if err else ""))
+            else:
+                log_warn(msg + (f" stderr={err}" if err else ""))
+        else:
+            # Real failure: nothing usable
+            msg = (
+                f"snmpwalk failed for {root_oid} on {host}:{port} "
+                f"with exit code {proc.returncode}: {err}"
+            )
+            if suppress_errors:
+                log_warn(msg)
+            else:
+                log_error(msg)
+            return []
+
+    log_info(f"SNMP walk {root_oid} returned {len(results)} OIDs")
+    return results
+
 
     for line in out.splitlines():
         line = line.strip()
@@ -856,9 +914,10 @@ def main():
             "Discover interesting scalar and table-like SNMP OIDs on a device "
             "and write a YAML profile suitable for oid2zabbix-template.py.\n"
             "Filtering is entirely driven by --filter-file (mib2/vendor/lld).\n"
-            "Always walks .1.3.6.1.2.1 and .1.3.6.1.4.1 plus any extra --root.\n"
-            "If the .1.3.6.1.4.1 walk fails, each lld.include_roots subtree "
-            "under .1.3.6.1.4.1 is walked individually."
+            "Always walks .1.3.6.1.2.1 plus vendor roots derived from the profile "
+            "(lld.include_roots) and any extra --root.\n"
+            "If the .1.3.6.1.4.1 is added via --root and that walk fails, each "
+            "lld.include_roots subtree under .1.3.6.1.4.1 is walked individually."
         )
     )
     parser.add_argument("--host", help="SNMP target host/IP")
@@ -878,7 +937,8 @@ def main():
         action="append",
         help=(
             "Additional root OID to walk (numeric). "
-            "Script always walks .1.3.6.1.2.1 and .1.3.6.1.4.1 by default."
+            "Script always walks .1.3.6.1.2.1 by default and also vendor roots "
+            "found in lld.include_roots."
         ),
     )
     parser.add_argument(
@@ -899,8 +959,8 @@ def main():
     )
     parser.add_argument(
         "--filter-file",
-        required=True,
-        help="YAML file with filters (mib2/vendor/lld). REQUIRED.",
+        default="filters/filters.yaml",
+        help="Path to filters YAML file  (default: filters/filters.yaml).",
     )
     parser.add_argument(
         "--no-filter",
@@ -939,14 +999,6 @@ def main():
 
     DEBUG = args.debug
     log_info(f"auto_oid_finder.py version: {VERSION}")
-
-    # Always walk these two, plus any extra --root
-    roots = [MIB2_ROOT, VENDOR_ROOT]
-    extra_roots = args.root or []
-    for r in extra_roots:
-        if r not in roots:
-            roots.append(r)
-    log_info(f"Effective roots to walk: {', '.join(roots)}")
 
     # ------------------------------------------------------------------
     # Load and validate filters.yaml (STRICT)
@@ -1019,6 +1071,30 @@ def main():
 
     log_info(f"LLD include_roots: {', '.join(lld_include_roots) if lld_include_roots else '(none)'}")
     log_info(f"LLD exclude_roots: {', '.join(lld_exclude_roots) if lld_exclude_roots else '(none)'}")
+
+    # ------------------------------------------------------------------
+    # Decide which OID roots to walk (profile-driven)
+    # ------------------------------------------------------------------
+    # Always walk MIB-2
+    roots = [MIB2_ROOT]
+
+    # Add vendor roots from LLD profile: anything under .1.3.6.1.4.1.
+    for r in lld_include_roots:
+        if r.startswith(VENDOR_ROOT + ".") and r not in roots:
+            roots.append(r)
+
+    # Also allow explicit --root overrides/additions
+    extra_roots = args.root or []
+    for r in extra_roots:
+        # allow user to specify without leading dot
+        if not r.startswith("."):
+            r = "." + r
+        if r not in roots:
+            roots.append(r)
+
+    log_info(f"Effective roots to walk: {', '.join(roots)}")
+
+
 
     # Observium MIBs
     observium_dir = None

@@ -1,4 +1,4 @@
-Version: 1.1
+Version: 1.2
 
 # ---------------------------------------------------------------------------
 # MIB-2 scalar filter:
@@ -114,9 +114,6 @@ lld:
     - ".1.3.6.1.2.1.2.2"        # ifTable
     - ".1.3.6.1.2.1.31.1.1"     # ifXTable
 
-    # Example vendor subtree (QNAP); safe to keep, device may not have it
-    - ".1.3.6.1.4.1.24681"      # QNAP NAS-MIB root (generic vendor include)
-
   # -------------------------------------------------------------------------
   # Tables we ALMOST NEVER want as LLD on ANY device:
   #   - routing tables
@@ -143,22 +140,4 @@ lld:
 
     # --- Net-SNMP cache tables (no useful metrics) ---
     - ".1.3.6.1.4.1.8072.1.5.3"     # nsCache* (NET-SNMP-AGENT-MIB)
-
-    # -----------------------------------------------------------------------
-    # Device-specific junk examples :
-    # Uncomment on devices where you know these subtrees are useless.
-    # -----------------------------------------------------------------------
-
-    # QNAP NAS-MIB: directory-like storageSystem/confSystem trees
-    - ".1.3.6.1.4.1.24681.1.3.9.1"
-    - ".1.3.6.1.4.1.24681.1.3.11.1"
-    - ".1.3.6.1.4.1.24681.1.4.1.1.1"
-    - ".1.3.6.1.4.1.24681.1.4.1.1.2"
-    - ".1.3.6.1.4.1.24681.1.4.1.1.3"
-    - ".1.3.6.1.4.1.24681.1.4.1.1.4"
-    - ".1.3.6.1.4.1.24681.1.4.1.1.5"
-    - ".1.3.6.1.4.1.24681.1.2.17.1"   # SysVolumeIndex table
-
-    # Other vendors 
-    # - ".1.3.6.1.4.1.xxx.yyy.zzz"      # vendor-specific index/cache tables
 

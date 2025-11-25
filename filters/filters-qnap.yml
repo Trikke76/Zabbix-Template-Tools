@@ -1,0 +1,96 @@
+Version: 1.1-qnap
+
+mib2:
+  regex: >
+    (
+      sysDescr|sysObjectID|sysName|sysLocation|sysContact|
+      contact|description|location|name|objectid|
+      vendor|manufacturer|model|hardware|system|
+      cpu|processor|
+      mem|memory|hrMemorySize|
+      sysUpTime|
+      hrProcessorLoad|
+      hrStorageUsed|hrStorageSize|hrStorageDescr|
+      ifNumber|
+      ifAdminStatus|ifOperStatus|
+      ifSpeed|ifHighSpeed
+    )
+
+vendor:
+  regex: >
+    (
+      model|system|hardware|
+      chassis|board|
+      cpu|processor|load|usage|util|
+      mem|memory|ram|swap|
+      disk|hdd|ssd|raid|array|lun|volume|pool|storage|
+      psu|ps|power|watt|volt|voltage|current|amps|
+      net|nic|link|throughput|bandwidth|speed|
+      temp|temperature|thermal|
+      fan|rpm|
+      humidity|
+      error|errors|fail|failed|fault|
+      status|state|health|ok|
+      alarm|alert|warning|critical|
+      ups|battery|runtime|charge|
+      toner|ink|drum|tray|paper|jam
+    )
+
+lld:
+  regex: >
+    (
+      ifHCInOctets|ifHCOutOctets|
+      ifInOctets|ifOutOctets|
+      ifInDiscards|ifOutDiscards|
+      ifInErrors|ifOutErrors|
+      ifHighSpeed|ifSpeed|
+      ifOperStatus|ifAdminStatus|
+      ifType|
+      dot1qVlan|dot1qVlanStaticName|dot1qVlanFdbId|
+      dot1dTpFdbPort|
+      hrStorageUsed|hrStorageSize|hrStorageDescr|
+      volume|pool|lun|disk|
+      BattPacks|Battery|
+      Sensor|
+      Humidity|
+      temperature|temp|
+      voltage|volt|
+      Status
+    )
+
+  include_roots:
+    # Standard MIB-2 interfaces
+    - ".1.3.6.1.2.1.2.2"        # ifTable
+    - ".1.3.6.1.2.1.31.1.1"     # ifXTable
+
+    # QNAP vendor trees
+    - ".1.3.6.1.4.1.24681"      # classic QNAP NAS-MIB root
+    - ".1.3.6.1.4.1.55062"      # QNAP QTS enterprise root (sysObjectID)
+
+  exclude_roots:
+    # --- IP / routing / ARP ---
+    - ".1.3.6.1.2.1.4.21"
+    - ".1.3.6.1.2.1.4.24"
+    - ".1.3.6.1.2.1.4.22"
+
+    # --- TCP connection table ---
+    - ".1.3.6.1.2.1.6.13"
+
+    # --- Host Resources junk/directory tables ---
+    - ".1.3.6.1.2.1.25.3.2.1"
+    - ".1.3.6.1.2.1.25.4.2.1"
+    - ".1.3.6.1.2.1.25.5.1.1"
+
+    # --- Net-SNMP cache tables ---
+    - ".1.3.6.1.4.1.8072.1.5.3"
+
+    # QNAP NAS-MIB: directory-like storageSystem/confSystem trees
+    - ".1.3.6.1.4.1.24681.1.3.9.1"
+    - ".1.3.6.1.4.1.24681.1.3.11.1"
+    - ".1.3.6.1.4.1.24681.1.4.1.1.1"
+    - ".1.3.6.1.4.1.24681.1.4.1.1.2"
+    - ".1.3.6.1.4.1.24681.1.4.1.1.3"
+    - ".1.3.6.1.4.1.24681.1.4.1.1.4"
+    - ".1.3.6.1.4.1.24681.1.4.1.1.5"
+    - ".1.3.6.1.4.1.24681.1.2.17.1"
+
