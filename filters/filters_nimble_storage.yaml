@@ -1,24 +1,15 @@
-Version: 1.2
+Version: 1.0
 
 # ---------------------------------------------------------------------------
 # Enterprise OIDs reference:
 # Official registry of all vendor enterprise numbers:
 # https://www.iana.org/assignments/enterprise-numbers/
 #
-# Use this to determine which vendor subtree(s) to include in:
-#   lld.include_roots:
-#     - ".1.3.6.1.4.1.<enterprise>"
+# Nimble Storage enterprise ID:
+#   37447  =>  .1.3.6.1.4.1.37447
 #
-# Examples:
-#   QNAP      → 24681, 55062
-#   Synology  → 6574
-#   APC       → 318
-#   Cisco     → 9
-#   Mikrotik  → 14988
-#   HP        → 11
-#   Eaton     → 534
+# Use this OID in lld.include_roots to walk Nimble's vendor subtree.
 # ---------------------------------------------------------------------------
-
 
 # ---------------------------------------------------------------------------
 # MIB-2 scalar filter:
@@ -49,7 +40,7 @@ mib2:
     )
 
 # ---------------------------------------------------------------------------
-# Vendor scalar filter:
+# Vendor scalar filter (Nimble / generic storage):
 #   - broader match for enterprise/vendor trees (.1.3.6.1.4.1.*)
 #   - resource usage, hardware state, temperatures, fans, power, disks, etc.
 # ---------------------------------------------------------------------------
@@ -64,7 +55,7 @@ vendor:
       cpu|processor|load|usage|util|
 
       # Memory
-      mem|memory|ram|swap|
+      mem|memory|ram|swap|cache|
 
       # Storage
       disk|hdd|ssd|raid|array|lun|volume|pool|storage|
@@ -85,17 +76,14 @@ vendor:
       status|state|health|ok|
       alarm|alert|warning|critical|
 
-      # UPS / battery
-      ups|battery|runtime|charge|
-
-      # Printers (optional but harmless)
-      toner|ink|drum|tray|paper|jam
+      # UPS / battery (if present on platform)
+      ups|battery|runtime|charge
     )
 
 # ---------------------------------------------------------------------------
 # LLD table filter:
 #   - which tables are interesting enough to become LLD
-#   - works on standard MIB-2 ifTable/ifXTable and generic vendor tables
+#   - works on standard MIB-2 ifTable/ifXTable and Nimble/vendor tables
 # ---------------------------------------------------------------------------
 lld:
   regex: >
@@ -109,20 +97,14 @@ lld:
       ifOperStatus|ifAdminStatus|
       ifType|
 
-      # VLAN / bridge (LLD only, not scalars)
-      dot1qVlan|dot1qVlanStaticName|dot1qVlanFdbId|
-      dot1dTpFdbPort|
-
-      # Storage-related tables
+      # Storage-related tables (volumes, pools, disks)
       hrStorageUsed|hrStorageSize|hrStorageDescr|
-      volume|pool|lun|disk|
+      volume|volTable|pool|lun|disk|
 
       # Environmental / sensors
-      BattPacks|Battery|
-      Sensor|
-      Humidity|
       temperature|temp|
       voltage|volt|
+      fan|rpm|
       Status
     )
 
@@ -134,6 +116,9 @@ lld:
     - ".1.3.6.1.2.1.2.2"        # ifTable
     - ".1.3.6.1.2.1.31.1.1"     # ifXTable
 
+    # Nimble Storage vendor subtree
+    - ".1.3.6.1.4.1.37447"                  # Nimble Storage enterprise root
+
   # -------------------------------------------------------------------------
   # Tables we ALMOST NEVER want as LLD on ANY device:
   #   - routing tables
@@ -141,8 +126,6 @@ lld:
   #   - TCP connection tables
   #   - HR-MIB device / process directories
   #   - Net-SNMP cache tables
-  #
-  # These are global, device-agnostic junk tables for monitoring purposes.
   # -------------------------------------------------------------------------
   exclude_roots:
     # --- IP / routing / ARP ---
@@ -161,3 +144,11 @@ lld:
     # --- Net-SNMP cache tables (no useful metrics) ---
     - ".1.3.6.1.4.1.8072.1.5.3"     # nsCache* (NET-SNMP-AGENT-MIB)
 
+    # -----------------------------------------------------------------------
+    # Nimble-specific junk examples:
+    # If you discover any 'directory-like' tables that are not useful for
+    # monitoring, you can add them here later, e.g.:
+    #
+    # - ".1.3.6.1.4.1.37447.1.x.y.z"
+    #
+    # -----------------------------------------------------------------------
