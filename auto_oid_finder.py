@@ -3,7 +3,7 @@
 auto_oid_finder.py
 ==================
 
-Version: 1.0.15
+Version: 1.0.16
 
 Changelog (short)
 -----------------
@@ -28,6 +28,7 @@ Changelog (short)
 1.0.14: Stop walking .1.3.6.1.4.1 by default; you can add it or specific vendor
          subtrees (e.g. .1.3.6.1.4.1.24681) via --root.
 1.0.15: Keep partial data when a walk gives timeout.
+1.0.16: Moved to snmpbulkwalk for performance reasons with fallback to snmpwalk
 
 Purpose
 -------
@@ -72,7 +73,7 @@ from datetime import datetime, timezone
 
 import yaml
 
-VERSION = "1.0.15"
+VERSION = "1.0.16"
 
 MIB2_ROOT = ".1.3.6.1.2.1"
 VENDOR_ROOT = ".1.3.6.1.4.1"
@@ -256,41 +257,58 @@ def snmptranslate_enrich(
 # ---------------------------------------------------------------------------
 # SNMP walk via net-snmp snmpwalk
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# SNMP walk via net-snmp snmpwalk / snmpbulkwalk
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# SNMP walk via net-snmp snmpwalk / snmpbulkwalk
+# ---------------------------------------------------------------------------
 def run_snmpwalk(
     host: str,
     community: str,
     root_oid: str,
     port: int,
-    timeout: int,
-    retries: int,
+    timeout: int = DEFAULT_TIMEOUT,
+    retries: int = DEFAULT_RETRIES,
     suppress_errors: bool = False,
+    use_bulk: bool = False,
 ) -> list[tuple[str, str, str]]:
     """
-    Run net-snmp snmpwalk and return a list of (oid, type, value).
+    Run snmpwalk (or snmpbulkwalk when use_bulk=True) and return a list of
+    (oid, type, value) tuples.
 
-    We always request numeric OIDs (-On).
+    Argument order matches the original call sites:
 
-    If suppress_errors=True, non-zero exit codes are logged as [warn]
-    and we still keep any partial data that was returned (if any).
+        run_snmpwalk(host, community, root_oid, port, timeout, retries,
+                     suppress_errors=suppress, use_bulk=use_bulk)
+
+    Behaviour:
+      - If use_bulk=True, use snmpbulkwalk with -Cn0 -Cr50.
+      - Do NOT raise on non-zero exit codes; parse what we can.
+      - Filter out timeout / end-of-MIB messages from output.
     """
-    cmd = [
-        "snmpwalk",
+    tool = "snmpbulkwalk" if use_bulk else "snmpwalk"
+
+    cmd: list[str] = [
+        tool,
         "-v2c",
-        "-c",
-        community,
+        "-c", community,
         "-On",
-        "-t",
-        str(timeout),
-        "-r",
-        str(retries),
-        f"{host}:{port}",
-        root_oid,
+        "-t", str(timeout),
+        "-r", str(retries),
     ]
+
+    if use_bulk:
+        # 0 non-repeaters, 50 max-repetitions is a decent default
+        cmd.extend(["-Cn0", "-Cr50"])
+
+    # host:port and root oid
+    cmd.extend([f"{host}:{port}", root_oid])
+
     log_info(f"SNMP walk {root_oid} on {host}:{port}...")
     log_debug(" ".join(cmd))
 
     try:
-        # Do NOT raise on non-zero exit codes; we want partial data.
         proc = subprocess.run(
             cmd,
             stdout=subprocess.PIPE,
@@ -298,7 +316,7 @@ def run_snmpwalk(
             check=False,
         )
     except FileNotFoundError:
-        log_error("snmpwalk not found in PATH. Install net-snmp tools.")
+        log_error(f"{tool} not found in PATH. Install net-snmp tools.")
         return []
 
     out = proc.stdout.decode("utf-8", errors="replace")
@@ -310,6 +328,7 @@ def run_snmpwalk(
         line = line.strip()
         if not line:
             continue
+
         # Drop timeout / end-of-view messages from output
         if line.startswith("Timeout:"):
             continue
@@ -318,6 +337,7 @@ def run_snmpwalk(
 
         if " = " not in line:
             continue
+
         oid_part, rest = line.split(" = ", 1)
         oid_part = oid_part.strip()
         rest = rest.strip()
@@ -327,34 +347,16 @@ def run_snmpwalk(
             type_part = type_part.strip()
             value_part = value_part.strip()
         else:
-            type_part = rest
-            value_part = ""
+            type_part = ""
+            value_part = rest.strip()
 
         results.append((oid_part, type_part, value_part))
 
-    if proc.returncode != 0:
-        if results:
-            # Partial success: we got some useful data
-            msg = (
-                f"snmpwalk for {root_oid} on {host}:{port} "
-                f"returned exit code {proc.returncode} but produced "
-                f"{len(results)} OIDs; using partial data."
-            )
-            if suppress_errors:
-                log_warn(msg + (f" stderr={err}" if err else ""))
-            else:
-                log_warn(msg + (f" stderr={err}" if err else ""))
-        else:
-            # Real failure: nothing usable
-            msg = (
-                f"snmpwalk failed for {root_oid} on {host}:{port} "
-                f"with exit code {proc.returncode}: {err}"
-            )
-            if suppress_errors:
-                log_warn(msg)
-            else:
-                log_error(msg)
-            return []
+    if not results and err and not suppress_errors:
+        log_error(
+            f"snmpwalk failed for {root_oid} on {host}:{port} "
+            f"with exit code {proc.returncode}: {err}"
+        )
 
     log_info(f"SNMP walk {root_oid} returned {len(results)} OIDs")
     return results
@@ -730,6 +732,7 @@ def build_profile(
     lld_include_roots: list[str],
     lld_exclude_roots: list[str],
     no_filter: bool,
+    use_bulk: bool,
 ) -> tuple[dict, dict]:
     """
     Walk the given roots, collect OIDs, figure out scalars and tables,
@@ -755,6 +758,7 @@ def build_profile(
             timeout,
             retries,
             suppress_errors=suppress,
+            use_bulk=use_bulk,
         )
         if not res and root == VENDOR_ROOT:
             vendor_root_failed = True
@@ -789,6 +793,7 @@ def build_profile(
                 timeout,
                 retries,
                 suppress_errors=True,
+                use_bulk=use_bulk,
             )
             all_results.extend(sub_res)
 
@@ -987,6 +992,11 @@ def main():
         action="store_true",
         help="Show script version and exit",
     )
+    parser.add_argument(
+        "--snmp-bulk",
+        action="store_true",
+        help="Use snmpbulkwalk instead of snmpwalk for faster bulk retrieval (SNMP v2c)",
+    )
 
     pre_args, _ = parser.parse_known_args()
     if pre_args.version:
@@ -1129,6 +1139,7 @@ def main():
         lld_include_roots=lld_include_roots,
         lld_exclude_roots=lld_exclude_roots,
         no_filter=args.no_filter,
+        use_bulk=args.snmp_bulk,
     )
     elapsed = time.time() - t0
 

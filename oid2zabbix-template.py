@@ -3,7 +3,7 @@
 oid2zabbix-template.py
 ======================
 
-Version: 1.0.8
+Version: 1.0.16
 
 Take an auto_oid_finder profile YAML and turn it into a Zabbix 7.0 template.
 
@@ -23,23 +23,23 @@ Tables:
       key:      snmp.raw.walk[<root_oid_compact>]
       snmp_oid: walk[.root_oid]
       name:     RAW SNMP walk for <friendly table label>
-  - discovery rule (DEPENDENT):
+  - discovery rule:
       key:      auto.discovery[<root_oid_compact>]
-      name:     Auto LLD for <friendly table label>
       preprocessing:
-        - JAVASCRIPT: convert raw snmpwalk text → LLD JSON
-        - DISCARD_UNCHANGED_HEARTBEAT: 1h
+        1) JAVASCRIPT: parses raw snmpwalk text and produces JSON:
+             { "data": [ { "{#SNMPINDEX}": "...", "{#SOMENAME}": "..." }, ... ] }
+        2) DISCARD_UNCHANGED_HEARTBEAT
   - item prototypes:
       key:      <MIB-name>_<oid_tail>[{#SNMPINDEX}]
+      name:     <MIB-name or column name> [optional {#SOMENAME}]
       snmp_oid: get[.prefix.{#SNMPINDEX}]
 
 Additional:
   - Global dedup guard on Zabbix keys so we never emit two items or
     prototypes with the same key (scalar vs LLD, or cross-tables).
-
-New in 1.0.8:
-  - JavaScript-based LLD that actually works 🙂
-  - LLD macros derived from column names (ifName/ifDescr/ifAlias/etc.)
+  - LLD JavaScript is generated per-table and:
+      * always extracts {#SNMPINDEX} (last OID segment)
+      * optionally extracts a name macro from one TEXT column
 """
 
 import argparse
@@ -47,11 +47,10 @@ import os
 import re
 import sys
 import uuid
-import json
 
 import yaml
 
-VERSION = "1.0.8"
+VERSION = "1.0.16"
 
 ZABBIX_EXPORT_VERSION = "7.0"
 
@@ -179,6 +178,12 @@ def build_column_key(col: dict, root_oid: str) -> str:
     To avoid duplicate keys like ipAddressRowStatus[{#SNMPINDEX}] coming
     from different OID trees, we always append a short tail derived from
     the column prefix OID.
+
+    Example:
+      name:   ipAddressRowStatus
+      prefix: .1.3.6.1.2.1.4.34.1.3
+
+      => key: ipAddressRowStatus_4_34_1_3[{#SNMPINDEX}]
     """
     name = col.get("name")
     prefix = col.get("prefix", "")
@@ -294,167 +299,196 @@ def _friendly_table_label(root_oid: str, columns: list[dict]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# LLD macros + JavaScript
+# LLD JavaScript generator
 # ---------------------------------------------------------------------------
 
-def derive_lld_macros(root_oid: str, columns: list[dict]) -> list[dict]:
+def _build_lld_js(name_col_prefix: str | None, macro_key: str | None) -> str:
     """
-    Decide which columns should become LLD macros.
+    Build the per-table LLD JavaScript.
 
-    Very simple, generic heuristics:
-      - any column whose name looks like ifName/ifDescr/ifAlias -> {#IFNAME}/{#IFDESCR}/{#IFALIAS}
-      - columns containing 'descr' -> {#DESCR}
-      - columns containing 'name'  -> {#NAME}
-
-    This is enough to get nice macros on interface tables and some
-    vendor tables without hard-coding every vendor.
+    This version is more forgiving:
+      - does NOT rely on a strict regex for the OID
+      - works with raw numeric output like:
+          .1.3.6.1.2.1.2.2.1.2.2 = STRING: "eth0"
+      - still:
+          * always extracts {#SNMPINDEX}
+          * optionally extracts a name macro (e.g. {#IFDESCR})
     """
-    macros: list[dict] = []
-    seen_prefixes: set[str] = set()
+    lines: list[str] = []
+
+    # Boilerplate
+    lines.append(
+        "var lines = value.split('\\n');\n"
+        "var indexMap = {};\n"
+        "var nameMap = {};\n"
+    )
+
+    if name_col_prefix:
+        lines.append(f'var NAME_COL_PREFIX = "{name_col_prefix}";\n')
+    else:
+        lines.append("var NAME_COL_PREFIX = null;\n")
+
+    if macro_key:
+        lines.append(f'var MACRO_KEY = "{macro_key}";\n')
+    else:
+        lines.append("var MACRO_KEY = null;\n")
+
+    # Main parsing loop
+    lines.append(
+        """
+for (var i = 0; i < lines.length; i++) {
+    var line = lines[i].trim();
+    if (!line) {
+        continue;
+    }
+
+    // We expect something like:
+    //   .1.3.6.1.2.1.2.2.1.2.2 = STRING: "eth0"
+    var eqPos = line.indexOf(" = ");
+    if (eqPos === -1) {
+        continue;
+    }
+
+    var oidPart = line.substring(0, eqPos).trim();
+    var rest = line.substring(eqPos + 3).trim(); // after " = "
+
+    // Normalize OID: if it ever has a MIB name, strip it, but
+    // in your case it's already numeric (.1.3.6....)
+    var oidNorm = oidPart;
+    var dbl = oidNorm.indexOf("::");
+    if (dbl !== -1) {
+        oidNorm = oidNorm.substring(dbl + 2);
+    }
+
+    // Split on '.' and take the last numeric segment as index
+    var parts = oidNorm.split(".").filter(function(p) { return p.length > 0; });
+    if (parts.length < 1) {
+        continue;
+    }
+
+    var index = parts[parts.length - 1];
+    if (!/^\\d+$/.test(index)) {
+        continue;
+    }
+
+    // Record that we saw this index
+    indexMap[index] = true;
+
+    // Parse value, strip "TYPE: " and quotes
+    var rawVal = rest;
+    var mt = rest.match(/^[A-Z0-9\\-]+:\\s*(.*)$/);
+    if (mt) {
+        rawVal = mt[1];
+    }
+    rawVal = rawVal.replace(/^"(.*)"$/, "$1");
+
+    // If this OID belongs to the chosen "name" column, store name
+    if (NAME_COL_PREFIX) {
+        // NAME_COL_PREFIX is numeric (e.g. ".1.3.6.1.2.1.2.2.1.2")
+        if (oidPart.indexOf(NAME_COL_PREFIX + ".") === 0 ||
+            oidPart === NAME_COL_PREFIX) {
+            nameMap[index] = rawVal;
+        }
+    }
+}
+"""
+    )
+
+    # Build final LLD JSON: [{"{#SNMPINDEX}": "1", "{#IFDESCR}": "eth0"}, ...]
+    lines.append(
+        """
+var data = [];
+for (var idx in indexMap) {
+    if (!indexMap.hasOwnProperty(idx)) {
+        continue;
+    }
+    var row = { "{#SNMPINDEX}": idx };
+    if (MACRO_KEY && Object.prototype.hasOwnProperty.call(nameMap, idx)) {
+        row[MACRO_KEY] = nameMap[idx];
+    }
+    data.push(row);
+}
+
+return JSON.stringify({ "data": data });
+"""
+    )
+
+    return "".join(lines)
+
+# ---------------------------------------------------------------------------
+# Table → LLD builder
+# ---------------------------------------------------------------------------
+
+def _pick_name_column(columns: list[dict]) -> tuple[str | None, str | None]:
+    """
+    Heuristic to pick a "name" column for LLD macro enrichment.
+
+    Returns (name_col_prefix, macro_key) where:
+      - name_col_prefix is the numeric OID prefix for that column
+      - macro_key is something like "{#IFDESCR}" or "{#NAME}"
+
+    If no suitable column is found, returns (None, None).
+    """
+    # Candidate keywords in column name/description
+    KEYWORDS_PRIMARY = [
+        "name", "descr", "description", "label",
+        "mount", "volume", "disk", "filesystem", "fs",
+        "interface", "ifname", "port", "slot",
+    ]
+    KEYWORDS_SECONDARY = [
+        "index", "id", "entry",
+    ]
+
+    best_col = None
+    best_score = -1
 
     for col in columns:
         prefix = col.get("prefix")
-        if not prefix or prefix in seen_prefixes:
+        if not prefix:
             continue
 
+        value_class = (col.get("value_class") or "").upper()
+        sample_type = (col.get("sample_type") or "").upper()
         name = (col.get("name") or "").lower()
-        if not name:
+        desc = (col.get("description") or "").lower()
+
+        # Only consider TEXTish columns
+        if not (
+            value_class == "TEXT"
+            or "OCTET STRING" in sample_type
+        ):
             continue
 
-        macro = None
-        if "ifname" in name:
-            macro = "{#IFNAME}"
-        elif "ifdescr" in name:
-            macro = "{#IFDESCR}"
-        elif "ifalias" in name:
-            macro = "{#IFALIAS}"
-        elif "descr" in name:
-            macro = "{#DESCR}"
-        elif "name" in name:
-            macro = "{#NAME}"
+        score = 0
+        for kw in KEYWORDS_PRIMARY:
+            if kw in name or kw in desc:
+                score += 5
+        for kw in KEYWORDS_SECONDARY:
+            if kw in name or kw in desc:
+                score += 1
 
-        if macro:
-            macros.append({"prefix": prefix, "macro": macro})
-            seen_prefixes.add(prefix)
+        # Light bonus if column name ends with "Name" or "Descr"
+        if name.endswith("name") or name.endswith("descr"):
+            score += 3
 
-    return macros
+        if score > best_score:
+            best_score = score
+            best_col = col
 
+    if not best_col or best_score <= 0:
+        return None, None
 
-def build_lld_js(table_root: str, col_macros: list[dict]) -> str:
-    """
-    Build the JavaScript that turns raw snmpwalk TEXT into LLD JSON.
+    prefix = best_col.get("prefix")
+    raw_name = best_col.get("name") or "NAME"
+    macro_id = re.sub(r"[^A-Za-z0-9]", "_", raw_name.upper()) or "NAME"
+    macro_key = f"{{#{macro_id}}}"
 
-    It expects the master item to contain lines like:
-      .OID = TYPE: value
+    log_debug(
+        f"Chosen name column for LLD: prefix={prefix}, "
+        f"name={best_col.get('name')}, macro={macro_key}"
+    )
 
-    and will output:
-      [
-        {"{#SNMPINDEX}": "1", "...": "..."},
-        ...
-      ]
-    """
-    col_defs_json = json.dumps(col_macros, separators=(",", ":"))
-
-    js = f"""
-// Auto-generated by oid2zabbix-template.py
-// Converts raw snmpwalk TEXT into LLD JSON for table rooted at {table_root}.
-
-var TABLE_ROOT = "{table_root}";
-var COL_DEFS = {col_defs_json};
-// Example COL_DEFS element:
-// {{ "prefix": ".1.3.6.1.2.1.2.2.1.2", "macro": "{{#IFDESCR}}" }}
-
-function startsWith(str, prefix) {{
-    return str.lastIndexOf(prefix, 0) === 0;
-}}
-
-function getIndexFromOID(oid) {{
-    if (!startsWith(oid, TABLE_ROOT)) {{
-        return null;
-    }}
-    var tail = oid.substring(TABLE_ROOT.length);
-    if (tail.charAt(0) === '.') {{
-        tail = tail.substring(1);
-    }}
-    var parts = tail.split('.');
-    if (parts.length < 2) {{
-        return null;
-    }}
-    // first part is the column id, the rest is the index
-    parts.shift();
-    return parts.join('.');
-}}
-
-function parseLine(line) {{
-    line = line.trim();
-    if (!line || line.charAt(0) !== '.') {{
-        return null;
-    }}
-
-    var eqPos = line.indexOf(' = ');
-    if (eqPos === -1) {{
-        return null;
-    }}
-
-    var oid = line.substring(0, eqPos).trim();
-    var rhs = line.substring(eqPos + 3).trim();
-
-    var colonPos = rhs.indexOf(':');
-    var val;
-    if (colonPos === -1) {{
-        val = rhs;
-    }} else {{
-        val = rhs.substring(colonPos + 1).trim();
-    }}
-
-    if ((val.charAt(0) === '"' && val.charAt(val.length - 1) === '"') ||
-        (val.charAt(0) === '\\'' && val.charAt(val.length - 1) === '\\'')) {{
-        val = val.substring(1, val.length - 1);
-    }}
-
-    return {{
-        oid: oid,
-        value: val
-    }};
-}}
-
-var lines = value.split(/\\r?\\n/);
-var byIndex = {{}};
-
-for (var i = 0; i < lines.length; i++) {{
-    var parsed = parseLine(lines[i]);
-    if (!parsed) {{
-        continue;
-    }}
-
-    var idx = getIndexFromOID(parsed.oid);
-    if (idx === null) {{
-        continue;
-    }}
-
-    if (!byIndex[idx]) {{
-        byIndex[idx] = {{}};
-        byIndex[idx]["{{#SNMPINDEX}}"] = idx;
-    }}
-
-    for (var j = 0; j < COL_DEFS.length; j++) {{
-        var col = COL_DEFS[j];
-        if (startsWith(parsed.oid, col.prefix + ".")) {{
-            byIndex[idx][col.macro] = parsed.value;
-        }}
-    }}
-}}
-
-var result = [];
-for (var k in byIndex) {{
-    if (byIndex.hasOwnProperty(k)) {{
-        result.push(byIndex[k]);
-    }}
-}}
-
-return JSON.stringify(result);
-"""
-    return js.strip("\n")
+    return prefix, macro_key
 
 
 def make_table_lld(table: dict) -> tuple[list[dict], dict]:
@@ -466,6 +500,8 @@ def make_table_lld(table: dict) -> tuple[list[dict], dict]:
     Zabbix async SNMP pattern for master:
       key:      snmp.raw.walk[1_3_6_1_2_1_25_3_3_1]
       snmp_oid: walk[.1.3.6.1.2.1.25.3.3.1]
+
+    We only put the table root OID in walk[] to avoid snmp_oid being too long.
     """
     root_oid = table.get("root_oid")
     if not root_oid:
@@ -478,6 +514,10 @@ def make_table_lld(table: dict) -> tuple[list[dict], dict]:
 
     # Build a friendly label for UI names
     table_label = _friendly_table_label(root_oid, columns)
+
+    # Try to pick a "name" column for macros
+    name_col_prefix, macro_key = _pick_name_column(columns)
+    js_script = _build_lld_js(name_col_prefix, macro_key)
 
     # Safe root ID for discovery key
     safe_root = root_oid.lstrip(".").replace(".", "_")
@@ -494,6 +534,11 @@ def make_table_lld(table: dict) -> tuple[list[dict], dict]:
         desc_lines.append("Example OIDs:")
         for eo in example_oids[:5]:
             desc_lines.append(f"  - {eo}")
+
+    if name_col_prefix and macro_key:
+        desc_lines.append(
+            f"LLD name macro {macro_key} derived from column prefix {name_col_prefix}."
+        )
 
     desc = "\n".join(desc_lines)
 
@@ -513,34 +558,6 @@ def make_table_lld(table: dict) -> tuple[list[dict], dict]:
         ],
     }
 
-    # Build LLD JS + preprocessing
-    col_macros = derive_lld_macros(root_oid, columns)
-        # Decide which macro to use in prototype names (port/disk label, etc.)
-    label_macro = None
-    if col_macros:
-        macro_priority = ["{#IFDESCR}", "{#IFNAME}", "{#LABEL}", "{#SNMPINDEX}"]
-        available = [m["macro"] for m in col_macros]
-        for m in macro_priority:
-            if m in available:
-                label_macro = m
-                break
-        # Fallback: just take the first macro if nothing matched priority list
-        if label_macro is None:
-            label_macro = col_macros[0]["macro"]
-
-    js_code = build_lld_js(root_oid, col_macros)
-
-    preprocessing = [
-        {
-            "type": "JAVASCRIPT",
-            "parameters": [js_code],
-        },
-        {
-            "type": "DISCARD_UNCHANGED_HEARTBEAT",
-            "parameters": ["1h"],
-        },
-    ]
-
     dr = {
         "uuid": uuid.uuid4().hex,
         "name": f"Auto LLD for {table_label}",
@@ -549,27 +566,20 @@ def make_table_lld(table: dict) -> tuple[list[dict], dict]:
         "delay": DEFAULT_DISCOVERY_DELAY,
         "master_item": {"key": master_key},
         "description": desc,
-        "preprocessing": preprocessing,
+        "preprocessing": [
+            {
+                "type": "JAVASCRIPT",
+                "parameters": [js_script],
+            },
+            {
+                "type": "DISCARD_UNCHANGED_HEARTBEAT",
+                "parameters": ["1h"],
+            },
+        ],
         "item_prototypes": [],
         "trigger_prototypes": [],
     }
 
-    # Optional: very simple LLD filter using the first macro (if any)
-    if col_macros:
-        macro_name = col_macros[0]["macro"]
-        dr["filter"] = {
-            "evaltype": "AND",
-            "conditions": [
-                {
-                    "macro": macro_name,
-                    "value": ".*",
-                    "operator": "MATCHES_REGEX",
-                    "formulaid": "A",
-                }
-            ],
-        }
-
-    # Item prototypes
     for col in columns:
         prefix = col.get("prefix")
         if not prefix:
@@ -581,7 +591,7 @@ def make_table_lld(table: dict) -> tuple[list[dict], dict]:
         sample_type = col.get("sample_type")
         value_class = col.get("value_class") or "TEXT"
 
-        # Base metric name from MIB/module
+        # Base name from MIB/module
         if module and name:
             base_name = f"{module}::{name}"
         elif name:
@@ -589,11 +599,14 @@ def make_table_lld(table: dict) -> tuple[list[dict], dict]:
         else:
             base_name = prefix
 
-        # Human-friendly prototype name including LLD macro (port/disk/index)
-        if label_macro:
-            proto_name = f"{label_macro}: {base_name}"
+        # Clean prototype name:
+        # - If we have a name macro: IF-MIB::ifInOctets [eth0]
+        # - Otherwise: IF-MIB::ifInOctets [{#SNMPINDEX}]
+        if macro_key:
+            proto_name = f"{base_name} [{macro_key}]"
         else:
-            proto_name = f"{{#SNMPINDEX}}: {base_name}"
+            proto_name = f"{base_name} [{{#SNMPINDEX}}]"
+
 
         col_snmp_oid = f"{prefix}.{{#SNMPINDEX}}"
         proto_key = build_column_key(col, root_oid)
@@ -649,6 +662,17 @@ def build_zabbix_template(
 ) -> tuple[dict, dict]:
     """
     Build the full Zabbix export structure from an auto_oid_finder profile.
+
+    IMPORTANT:
+      - Any scalar whose OID lives under a table root is SKIPPED as a
+        regular item, to avoid having both a normal item and an LLD
+        item for the same data.
+      - By default, we only export scalars where entry['selected'] is True.
+        Use all_scalars=True to ignore that flag and export everything.
+      - We enforce global uniqueness of item keys across:
+          * scalar items
+          * table master items
+          * LLD item prototypes
     """
     scalars = profile.get("scalars") or []
     tables = profile.get("tables") or []
@@ -659,7 +683,7 @@ def build_zabbix_template(
     # Global set of used Zabbix keys
     used_keys: set[str] = set()
 
-    # Collect table roots (normalized) to avoid exporting scalars under them
+    # Collect table roots (normalized)
     table_roots = []
     for t in tables:
         r = t.get("root_oid")
@@ -674,6 +698,7 @@ def build_zabbix_template(
         for r in table_roots:
             if not r:
                 continue
+            # if scalar OID is equal to or under the table root subtree
             if n == r or n.startswith(r + "."):
                 return True
         return False
@@ -681,7 +706,6 @@ def build_zabbix_template(
     scalar_count = 0
     total_scalars = len(scalars)
 
-    # Scalars
     if include_scalars:
         for s in scalars:
             oid = s.get("oid")
@@ -720,11 +744,21 @@ def build_zabbix_template(
             items.append(item)
             scalar_count += 1
 
-    # Tables / LLD
     table_count = 0
     lld_count = 0
     if include_tables:
         for t in tables:
+            root_oid = t.get("root_oid") or ""
+
+            # Skip generic enterprise roots like .1.3.6.1.4.1.X (no real table)
+            parts = root_oid.lstrip(".").split(".") if root_oid else []
+            if (
+                len(parts) == 7
+                and parts[:6] == ["1", "3", "6", "1", "4", "1"]
+            ):
+                log_debug(f"Skipping generic enterprise root table {root_oid}")
+                continue
+
             rows = t.get("approx_rows", 0)
             cols = t.get("approx_columns", 0)
             if rows < min_rows or cols < min_cols:
@@ -770,9 +804,13 @@ def build_zabbix_template(
             dr["item_prototypes"] = real_protos
 
             discovery_rules.append(dr)
-            table_count += 1
             if real_protos:
                 lld_count += 1
+
+        # Drop discovery rules that ended up with zero item prototypes
+        discovery_rules = [dr for dr in discovery_rules if dr.get("item_prototypes")]
+        table_count = len(discovery_rules)
+        lld_count = table_count
 
     macros = [
         {
@@ -837,8 +875,9 @@ def main():
             "Scalars under table roots are NOT exported as regular items.\n"
             "By default, only scalars with selected=true are exported; use "
             "--all-scalars to include every scalar.\n"
-            "Discovery rules are DEPENDENT items that use JavaScript preprocessing "
-            "to convert the raw walk TEXT into LLD JSON."
+            "LLD JavaScript is generated per-table and always extracts {#SNMPINDEX}; "
+            "it also optionally adds a name macro like {#IFDESCR} when a suitable "
+            "TEXT column is available."
         )
     )
     parser.add_argument(
