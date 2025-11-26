@@ -1,4 +1,4 @@
-Version: 1.2
+Version: 1.3
 
 # ---------------------------------------------------------------------------
 # Enterprise OIDs reference:
@@ -98,32 +98,47 @@ vendor:
 #   - works on standard MIB-2 ifTable/ifXTable and generic vendor tables
 # ---------------------------------------------------------------------------
 lld:
+  # New: exact MIB names – must match *label* exactly
+  exact_names:
+    # Interface traffic counters (MIB-2/ifXTable)
+    - ifHCInOctets
+    - ifHCOutOctets
+    - ifInOctets
+    - ifOutOctets
+    - ifInDiscards
+    - ifOutDiscards
+    - ifInErrors
+    - ifOutErrors
+    # Interface status / speed (ook standaard MIB-2)
+    - ifHighSpeed
+    - ifSpeed
+    - ifOperStatus
+    - ifAdminStatus
+    - ifType
+    # Host Resources storage tabel
+    - hrStorageUsed
+    - hrStorageSize
+    - hrStorageDescr
+
+# Existing: fuzzy / regex-based matching
   regex: >
     (
-      # Interface traffic + errors
-      ifHCInOctets|ifHCOutOctets|
-      ifInOctets|ifOutOctets|
-      ifInDiscards|ifOutDiscards|
-      ifInErrors|ifOutErrors|
-      ifHighSpeed|ifSpeed|
-      ifOperStatus|ifAdminStatus|
-      ifType|
+      # VLAN / bridge (LLD only, niet als scalar)
+      \bdot1qVlan\w*|
+      \bdot1dTpFdbPort\b|
 
-      # VLAN / bridge (LLD only, not scalars)
-      dot1qVlan|dot1qVlanStaticName|dot1qVlanFdbId|
-      dot1dTpFdbPort|
-
-      # Storage-related tables
-      hrStorageUsed|hrStorageSize|hrStorageDescr|
-      volume|pool|lun|disk|
+      # Storage-gerelateerde tabellen (vendor/generic)
+      \b(volume|pool|lun|raid|array|disk|hdd|ssd)\b|
 
       # Environmental / sensors
-      BattPacks|Battery|
-      Sensor|
-      Humidity|
-      temperature|temp|
-      voltage|volt|
-      Status
+      \b(temp|temperature|thermal)\b|
+      \b(fan|fanSpeed|fanRpm|rpm)\b|
+      \b(humidity|humid)\b|
+      \b(voltage|volt|vdc|vac)\b|
+      \b(current|amps?|ampere)\b|
+
+      # UPS / battery (generiek)
+      \b(ups|battery|battPacks?|runtime|charge|capacity)\b
     )
 
   # -------------------------------------------------------------------------
@@ -149,6 +164,8 @@ lld:
     - ".1.3.6.1.2.1.4.21"           # ipRouteTable
     - ".1.3.6.1.2.1.4.24"           # ipCidrRouteTable
     - ".1.3.6.1.2.1.4.22"           # ipNetToMediaTable (ARP)
+    - ".1.3.6.1.2.1.25.3.7.1.1"     # hrPartitionIndex table
+    - ".1.3.6.1.2.1.25.3.8.1"       # hrFSIndex table
 
     # --- TCP connection table (massive, rarely useful in LLD) ---
     - ".1.3.6.1.2.1.6.13"           # tcpConnTable

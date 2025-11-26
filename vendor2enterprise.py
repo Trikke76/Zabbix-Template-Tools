@@ -1,421 +1,387 @@
 #!/usr/bin/env python3
 """
 vendor2enterprise.py
+====================
 
-Helper tool to map vendor names to IANA enterprise numbers and optionally
-generate a filters/filters_<vendor>.yaml file suitable for auto_oid_finder.py.
+Version: 1.0.0
 
-Data source for enterprise numbers:
+A modern helper tool that maps vendor names to IANA Enterprise Numbers.
+It supports:
+    - Full IANA enterprise-numbers list (cached locally)
+    - Fuzzy vendor matching on the entire IANA database
+    - Manual enterprise override via --enterprise
+    - Optional generation of filter YAML extensions for auto_oid_finder.py
+    - Offline-safe cached mode
+
+Cache:
+    data/iana_enterprise_numbers.txt
+Source:
     https://www.iana.org/assignments/enterprise-numbers/
 
-Features:
-  - Fuzzy matching on vendor name (e.g. "nimble", "hpe nimble", "qnap").
-  - Prints enterprise ID and .1.3.6.1.4.1.<enterprise> root.
-  - With --write-filter, generates a filter YAML in filters/.
-    * For Nimble Storage, writes a storage-optimized filter.
-    * For other vendors, writes a generic boilerplate filter.
 """
 
 import argparse
 import os
 import re
 import sys
+import urllib.request
 import textwrap
+import ssl
+from pathlib import Path
 from typing import List, Dict, Any
 
-# ---------------------------------------------------------------------------
-# Vendor catalog
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# Constants
+# ----------------------------------------------------------------------------
 
-VENDORS: List[Dict[str, Any]] = [
-    {
-        "canonical": "QNAP (24681)",
-        "enterprise": 24681,
-        "aliases": ["qnap", "qnap 24681", "qnap nas"],
-        "notes": "Classic QNAP NAS-MIB",
-        "category": "storage",
-    },
-    {
-        "canonical": "QNAP (55062)",
-        "enterprise": 55062,
-        "aliases": ["qnap 55062", "qnap qts", "qnap qts5"],
-        "notes": "Newer QNAP QTS enterprise",
-        "category": "storage",
-    },
-    {
-        "canonical": "Nimble Storage",
-        "enterprise": 37447,
-        "aliases": ["nimble", "nimble storage", "hpe nimble"],
-        "notes": "HPE Nimble Storage arrays",
-        "category": "storage",
-    },
-    # You can add more vendors here:
-    # {
-    #     "canonical": "Cisco Systems",
-    #     "enterprise": 9,
-    #     "aliases": ["cisco"],
-    #     "notes": "Cisco routers/switches",
-    #     "category": "network",
-    # },
-]
+VERSION = "1.0.0"
+
+IANA_URL = (
+    "https://www.iana.org/assignments/enterprise-numbers/enterprise-numbers"
+)
+DEFAULT_CACHE_PATH = Path("data/iana_enterprise_numbers.txt")
 
 
-# ---------------------------------------------------------------------------
-# Fuzzy matching logic
-# ---------------------------------------------------------------------------
-
-def find_matches(query: str) -> List[Dict[str, Any]]:
-    q = query.lower().strip()
-    matches: List[tuple[int, Dict[str, Any]]] = []
-
-    for v in VENDORS:
-        all_names = [v["canonical"]] + v.get("aliases", [])
-        score = 0
-
-        for name in all_names:
-            n = name.lower()
-            if q == n:
-                score = max(score, 3)
-            elif q in n:
-                score = max(score, 2)
-            elif n in q:
-                score = max(score, 1)
-
-        if score > 0:
-            matches.append((score, v))
-
-    matches.sort(key=lambda x: (-x[0], x[1]["canonical"].lower()))
-    return [m[1] for m in matches]
-
+# ----------------------------------------------------------------------------
+# Utility: Slugify
+# ----------------------------------------------------------------------------
 
 def slugify(name: str) -> str:
-    # Convert to a safe filename slug: letters/numbers/underscore only.
     s = name.lower()
     s = re.sub(r"[^a-z0-9]+", "_", s)
-    s = re.sub(r"_+", "_", s).strip("_")
-    return s or "vendor"
+    s = re.sub(r"_+", "_", s)
+    return s.strip("_") or "vendor"
 
 
-# ---------------------------------------------------------------------------
-# Filter file content generators
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# IANA Cache Management
+# ----------------------------------------------------------------------------
 
-def generate_nimble_filter_yaml(ent: int) -> str:
+def download_iana_list(cache_path: Path) -> bool:
     """
-    Generate a Nimble-specific filter YAML content
-    based on your generic filters + storage tweaks.
+    Download the IANA enterprise numbers list and save locally.
+    """
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    print(f"[info] Downloading IANA enterprise numbers from {IANA_URL} ...")
+
+    try:
+        ctx = ssl._create_unverified_context()
+        with urllib.request.urlopen(IANA_URL, timeout=20, context=ctx) as resp:
+            text = resp.read().decode("utf-8", errors="replace")
+        cache_path.write_text(text, encoding="utf-8")
+        print(f"[info] IANA list saved to {cache_path}")
+        return True
+    except Exception as e:
+        print(f"[error] Failed to download IANA data: {e}")
+        return False
+
+
+def ensure_iana_cache(cache_path: Path, auto_sync: bool = False) -> str | None:
+    """
+    Ensure cached IANA file exists. Ask user if missing, unless auto_sync is on.
+    Returns the file content or None.
+    """
+    if not cache_path.exists():
+        print(f"[warn] No IANA cache found at: {cache_path}")
+
+        if not auto_sync:
+            ans = input("[prompt] Download IANA enterprise numbers now? [Y/n]: ").strip().lower()
+            if ans not in ("", "y", "yes"):
+                print("[info] Skipping download; cannot perform vendor lookup.")
+                return None
+
+        if not download_iana_list(cache_path):
+            return None
+
+    try:
+        return cache_path.read_text(encoding="utf-8")
+    except Exception as e:
+        print(f"[error] Failed to read IANA cache: {e}")
+        return None
+
+
+# ----------------------------------------------------------------------------
+# Parsing IANA Text
+# ----------------------------------------------------------------------------
+def parse_iana_entries(text: str) -> List[Dict[str, Any]]:
+    """
+    Parse IANA enterprise-numbers file to a list of entries.
+
+    Het IANA-formaat is ongeveer:
+        <number>
+          <org-name>
+              <contact stuff...>
+        <next number>
+          <next org-name>
+        ...
+
+    Soms staan number en name op dezelfde lijn, dat ondersteunen we ook:
+        9   Cisco Systems, Inc.
+    """
+    entries: List[Dict[str, Any]] = []
+
+    current_ent: int | None = None
+    waiting_for_name = False
+
+    for line in text.splitlines():
+        raw = line.rstrip("\n")
+        s = raw.strip()
+
+        if not s or s.startswith("#"):
+            continue
+
+        # Case 1: lijn begint met een nummer
+        m = re.match(r"^(\d+)\s*(.+)?$", s)
+        if m:
+            ent = int(m.group(1))
+            rest = (m.group(2) or "").strip()
+
+            if rest:
+                # "9 Cisco Systems, Inc." op één lijn
+                name = rest
+                entries.append(
+                    {
+                        "enterprise": ent,
+                        "name": name,
+                        "raw": raw,
+                    }
+                )
+                current_ent = None
+                waiting_for_name = False
+            else:
+                # "9" alleen → volgende niet-lege niet-comment lijn is de naam
+                current_ent = ent
+                waiting_for_name = True
+            continue
+
+        # Case 2: we hebben net een nummer gezien en wachten op de naam
+        if waiting_for_name and current_ent is not None:
+            name = s
+            entries.append(
+                {
+                    "enterprise": current_ent,
+                    "name": name,
+                    "raw": raw,
+                }
+            )
+            current_ent = None
+            waiting_for_name = False
+            continue
+
+        # Alle andere lijnen (contact, e-mails, etc.) negeren we
+
+    return entries
+
+
+def norm(s: str) -> str:
+    """
+    Normalise a string for fuzzy matching:
+      - lowercase
+      - remove all non-alphanumeric characters
+    So: 'Cisco Systems, Inc.' -> 'ciscosystemsinc'
+         'ciscoSystems'       -> 'ciscosystems'
+    """
+    s = s.lower()
+    s = re.sub(r"[^a-z0-9]+", "", s)
+    return s
+
+# ----------------------------------------------------------------------------
+# Fuzzy match on IANA database
+# ----------------------------------------------------------------------------
+
+def find_matches(query: str, entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Fuzzy vendor-name search on IANA entries, with a smarter scoring:
+      - exact normalised match: highest
+      - name starts with query: high
+      - query is prefix of name: high
+      - query only appears somewhere inside: lower
+
+    Tie-break:
+      1) smallest enterprise ID (bijv. Cisco = 9 wint van Cisco Sera = 45091)
+      2) shortest normalised name
+      3) alphabetical
+    """
+    q_raw = query.strip()
+    q_norm = norm(q_raw)
+
+    ranked: List[tuple[int, int, int, str, Dict[str, Any]]] = []
+
+    for v in entries:
+        ent = v["enterprise"]
+        name_raw = v["name"]
+        name_norm = norm(name_raw)
+
+        if not name_norm:
+            continue
+
+        score = 0
+
+        if q_norm == name_norm:
+            score = 100
+        elif name_norm.startswith(q_norm):
+            # "cisco" vs "ciscosystems" / "ciscosera"
+            score = 90
+        elif q_norm.startswith(name_norm):
+            score = 80
+        elif q_norm in name_norm:
+            score = 70
+        elif name_norm in q_norm:
+            score = 60
+
+        if score > 0:
+            ranked.append((score, ent, len(name_norm), name_raw.lower(), v))
+
+    # Sorteer: hoogste score, dan kleinste enterprise ID, dan kortste naam, dan alfabetisch
+    ranked.sort(key=lambda x: (-x[0], x[1], x[2], x[3]))
+    return [r[4] for r in ranked]
+
+
+# ----------------------------------------------------------------------------
+# Filter YAML generation
+# ----------------------------------------------------------------------------
+
+def generate_filter_yaml(ent: int, canonical: str) -> str:
+    """
+    Generate a simple vendor filter YAML (extension-style).
+    This is merged with filters.yaml by auto_oid_finder.py.
     """
     root = f".1.3.6.1.4.1.{ent}"
+
     return textwrap.dedent(
         f"""\
         Version: 1.0
 
-        # ---------------------------------------------------------------------------
-        # Enterprise OIDs reference:
-        # Official registry of all vendor enterprise numbers:
-        # https://www.iana.org/assignments/enterprise-numbers/
-        #
-        # Nimble Storage enterprise ID:
-        #   {ent}  =>  {root}
-        #
-        # Use this OID in lld.include_roots to walk Nimble's vendor subtree.
-        # ---------------------------------------------------------------------------
+        # Vendor: {canonical}
+        # Enterprise ID: {ent}
+        # Vendor OID root: {root}
 
-        # ---------------------------------------------------------------------------
-        # MIB-2 scalar filter:
-        #   - generic, useful metrics for any SNMP device
-        #   - system identity, CPU/memory, uptime, basic interface info
-        # ---------------------------------------------------------------------------
-        mib2:
-          regex: >
-            (
-              # ---------- System Identification ----------
-              sysDescr|sysObjectID|sysName|sysLocation|sysContact|
-              contact|description|location|name|objectid|
-              vendor|manufacturer|model|hardware|system|
-
-              # ---------- CPU / Memory / Uptime ----------
-              cpu|processor|
-              mem|memory|hrMemorySize|
-              sysUpTime|
-
-              # ---------- Host Resources ----------
-              hrProcessorLoad|
-              hrStorageUsed|hrStorageSize|hrStorageDescr|
-
-              # ---------- Interfaces (selected scalars only) ----------
-              ifNumber|
-              ifAdminStatus|ifOperStatus|
-              ifSpeed|ifHighSpeed
-            )
-
-        # ---------------------------------------------------------------------------
-        # Vendor scalar filter (Nimble / generic storage):
-        #   - broader match for enterprise/vendor trees (.1.3.6.1.4.1.*)
-        #   - resource usage, hardware state, temperatures, fans, power, disks, etc.
-        # ---------------------------------------------------------------------------
-        vendor:
-          regex: >
-            (
-              # Hardware / platform
-              model|system|hardware|
-              chassis|board|
-
-              # CPU / load
-              cpu|processor|load|usage|util|
-
-              # Memory
-              mem|memory|ram|swap|cache|
-
-              # Storage
-              disk|hdd|ssd|raid|array|lun|volume|pool|storage|
-
-              # Power / PSU
-              psu|ps|power|watt|volt|voltage|current|amps|
-
-              # Networking
-              net|nic|link|throughput|bandwidth|speed|
-
-              # Environmental
-              temp|temperature|thermal|
-              fan|rpm|
-              humidity|
-
-              # Health / status
-              error|errors|fail|failed|fault|
-              status|state|health|ok|
-              alarm|alert|warning|critical|
-
-              # UPS / battery (if present on platform)
-              ups|battery|runtime|charge
-            )
-
-        # ---------------------------------------------------------------------------
-        # LLD table filter:
-        #   - which tables are interesting enough to become LLD
-        #   - works on standard MIB-2 ifTable/ifXTable and Nimble/vendor tables
-        # ---------------------------------------------------------------------------
-        lld:
-          regex: >
-            (
-              # Interface traffic + errors
-              ifHCInOctets|ifHCOutOctets|
-              ifInOctets|ifOutOctets|
-              ifInDiscards|ifOutDiscards|
-              ifInErrors|ifOutErrors|
-              ifHighSpeed|ifSpeed|
-              ifOperStatus|ifAdminStatus|
-              ifType|
-
-              # Storage-related tables (volumes, pools, disks)
-              hrStorageUsed|hrStorageSize|hrStorageDescr|
-              volume|volTable|pool|lun|disk|
-
-              # Environmental / sensors
-              temperature|temp|
-              voltage|volt|
-              fan|rpm|
-              Status
-            )
-
-          # -------------------------------------------------------------------------
-          # Tables we ALWAYS want to consider for LLD (if present)
-          # -------------------------------------------------------------------------
-          include_roots:
-            # Standard MIB-2 interfaces
-            - ".1.3.6.1.2.1.2.2"        # ifTable
-            - ".1.3.6.1.2.1.31.1.1"     # ifXTable
-
-            # Nimble Storage vendor subtree
-            - "{root}"                  # Nimble Storage enterprise root
-
-          # -------------------------------------------------------------------------
-          # Tables we ALMOST NEVER want as LLD on ANY device:
-          #   - routing tables
-          #   - ARP
-          #   - TCP connection tables
-          #   - HR-MIB device / process directories
-          #   - Net-SNMP cache tables
-          # -------------------------------------------------------------------------
-          exclude_roots:
-            # --- IP / routing / ARP ---
-            - ".1.3.6.1.2.1.4.21"           # ipRouteTable
-            - ".1.3.6.1.2.1.4.24"           # ipCidrRouteTable
-            - ".1.3.6.1.2.1.4.22"           # ipNetToMediaTable (ARP)
-
-            # --- TCP connection table (massive, rarely useful in LLD) ---
-            - ".1.3.6.1.2.1.6.13"           # tcpConnTable
-
-            # --- Host Resources junk/directory tables ---
-            - ".1.3.6.1.2.1.25.3.2.1"       # hrDeviceTable (index directory)
-            - ".1.3.6.1.2.1.25.4.2.1"       # hrSWRunTable (process list)
-            - ".1.3.6.1.2.1.25.5.1.1"       # hrSWRunPerfTable (per-process perf)
-
-            # --- Net-SNMP cache tables (no useful metrics) ---
-            - ".1.3.6.1.4.1.8072.1.5.3"     # nsCache* (NET-SNMP-AGENT-MIB)
-
-            # -----------------------------------------------------------------------
-            # Nimble-specific junk examples:
-            # If you discover any 'directory-like' tables that are not useful for
-            # monitoring, you can add them here later, e.g.:
-            #
-            # - "{root}.1.x.y.z"
-            #
-            # -----------------------------------------------------------------------
-        """
-    ).rstrip() + "\n"
-
-
-def generate_generic_filter_yaml(ent: int, canonical: str) -> str:
-    """
-    Fallback template for vendors without a hand-tuned filter.
-    """
-    root = f".1.3.6.1.4.1.{ent}"
-    return textwrap.dedent(
-        f"""\
-        Version: 1.0
-
-        # ---------------------------------------------------------------------------
-        # Enterprise OIDs reference:
-        # Official registry of all vendor enterprise numbers:
-        # https://www.iana.org/assignments/enterprise-numbers/
-        #
-        # Vendor:
-        #   {canonical}
-        # Enterprise ID:
-        #   {ent}  =>  {root}
-        #
-        # Use this OID in lld.include_roots to walk the vendor subtree.
-        # ---------------------------------------------------------------------------
-
-        mib2:
-          regex: "(sysUpTime|hrProcessorLoad|hrStorageUsed|ifHighSpeed)"
-
-        vendor:
-          regex: "(cpu|mem|temperature|fan|disk|volume|status|power)"
+        # This file extends filters.yaml. Only vendor-specific parts need to be included.
 
         lld:
-          regex: "(ifHCInOctets|ifHCOutOctets|volume|disk|temperature|Status)"
-
           include_roots:
-            - ".1.3.6.1.2.1.2.2"
-            - ".1.3.6.1.2.1.31.1.1"
             - "{root}"
 
-          exclude_roots:
-            - ".1.3.6.1.2.1.4.21"
-            - ".1.3.6.1.2.1.4.24"
-            - ".1.3.6.1.2.1.4.22"
-            - ".1.3.6.1.2.1.6.13"
-            - ".1.3.6.1.2.1.25.3.2.1"
-            - ".1.3.6.1.2.1.25.4.2.1"
-            - ".1.3.6.1.2.1.25.5.1.1"
-            - ".1.3.6.1.4.1.8072.1.5.3"
+          # Example of vendor-specific exact names (empty by default)
+          exact_names: []
+
+          # Example vendor exclusions (user may extend)
+          exclude_roots: []
+
+        vendor:
+          # Extend vendor regex minimally (optional)
+          regex: "(disk|storage|temp|fan|power|status)"
+
         """
     ).rstrip() + "\n"
 
 
-def write_filter_file(
-    vendor: Dict[str, Any],
-    filters_dir: str,
-    force: bool = False,
-) -> str:
-    """
-    Generate a filters/filters_<slug>.yaml file for the given vendor.
-    Returns the path to the written file.
-    """
+def write_filter_file(canonical: str, ent: int, filters_dir: str, force: bool=False) -> str:
     os.makedirs(filters_dir, exist_ok=True)
 
-    canonical = vendor["canonical"]
-    ent = vendor["enterprise"]
-    category = vendor.get("category", "generic")
     slug = slugify(canonical)
-
-    filename = f"filters_{slug}.yaml"
-    path = os.path.join(filters_dir, filename)
+    fname = f"filters-{slug}.yml"
+    path = os.path.join(filters_dir, fname)
 
     if os.path.exists(path) and not force:
-        print(f"[warn] Filter file already exists: {path}")
-        print("       Use --force to overwrite.")
+        print(f"[warn] Not overwriting existing filter: {path}")
+        print("       Use --force to override.")
         return path
 
-    if canonical.lower().startswith("nimble"):
-        content = generate_nimble_filter_yaml(ent)
-    else:
-        # For now, Nimble has a tuned filter; everything else gets a generic one.
-        content = generate_nimble_filter_yaml(ent) if canonical == "Nimble Storage" else generate_generic_filter_yaml(ent, canonical)  # just in case
+    content = generate_filter_yaml(ent, canonical)
 
     with open(path, "w", encoding="utf-8") as f:
         f.write(content)
 
-    print(f"[info] Wrote filter file: {path}")
+    print(f"[info] Wrote vendor filter: {path}")
     return path
 
 
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 # Main CLI
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Map vendor name to enterprise ID and optionally generate a filters/*.yaml file."
+        description="Map vendor names to IANA enterprise IDs and optionally generate filter YAML."
     )
-    parser.add_argument(
-        "vendor_name",
-        nargs="+",
-        help="Vendor name (e.g. 'nimble', 'qnap', 'hpe nimble')",
-    )
-    parser.add_argument(
-        "--write-filter",
-        action="store_true",
-        help="Generate a filters/filters_<vendor>.yaml file for the best match.",
-    )
-    parser.add_argument(
-        "--filters-dir",
-        default="filters",
-        help="Directory where filter files are stored (default: filters).",
-    )
-    parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Overwrite existing filter file if it already exists.",
-    )
+
+    parser.add_argument("vendor_name", nargs="*", help="Vendor name for fuzzy search (ignored if --enterprise is used)")
+    parser.add_argument("--enterprise", type=int, help="Direct enterprise ID (overrides fuzzy matching).")
+    parser.add_argument("--name", help="Canonical vendor name when using --enterprise.")
+    parser.add_argument("--write-filter", action="store_true", help="Generate vendor filter file.")
+    parser.add_argument("--filters-dir", default="filters", help="Directory for vendor filter files.")
+    parser.add_argument("--iana-cache", default=str(DEFAULT_CACHE_PATH), help="Path to cached IANA list.")
+    parser.add_argument("--sync-iana", action="store_true", help="Force update IANA cache without prompting.")
+    parser.add_argument("--force", action="store_true", help="Overwrite existing filter file.")
+    parser.add_argument("--version", action="store_true", help="Show tool version and exit.")
 
     args = parser.parse_args()
-    query = " ".join(args.vendor_name).strip()
 
-    matches = find_matches(query)
+    if args.version:
+        print(f"vendor2enterprise.py version {VERSION}")
+        sys.exit(0)
+
+    cache_path = Path(args.iana_cache)
+
+    # --------------------------------------------------------------
+    # Mode 1: Direct enterprise ID (no fuzzy match)
+    # --------------------------------------------------------------
+    if args.enterprise is not None:
+        ent = args.enterprise
+        canonical = args.name or f"Enterprise {ent}"
+
+        print(f"[info] Using manually supplied enterprise ID: {ent}")
+        print(f"[info] Canonical name: {canonical}")
+        print(f"OID root: .1.3.6.1.4.1.{ent}")
+
+        if args.write_filter:
+            write_filter_file(canonical, ent, args.filters_dir, force=args.force)
+
+        return
+
+    # --------------------------------------------------------------
+    # Mode 2: Fuzzy vendor match via IANA database
+    # --------------------------------------------------------------
+
+    if not args.vendor_name:
+        print("[error] No vendor name provided and no --enterprise specified.")
+        sys.exit(1)
+
+    raw_iana = ensure_iana_cache(cache_path, auto_sync=args.sync_iana)
+    if raw_iana is None:
+        print("[error] No IANA data available.")
+        sys.exit(1)
+
+    entries = parse_iana_entries(raw_iana)
+    if not entries:
+        print("[error] Could not parse IANA enterprise list.")
+        sys.exit(1)
+
+    query = " ".join(args.vendor_name)
+    matches = find_matches(query, entries)
+
     if not matches:
-        print(f"No matches found for vendor name: {query!r}")
-        print("Hint: check the IANA enterprise registry:")
+        print(f"No matches found for: {query!r}")
+        print("Check the IANA list manually:")
         print("  https://www.iana.org/assignments/enterprise-numbers/")
         sys.exit(1)
 
     best = matches[0]
     ent = best["enterprise"]
-    root = f".1.3.6.1.4.1.{ent}"
+    canonical = best["name"]
 
-    print(f"Best match:   {best['canonical']}")
-    if best.get("aliases"):
-        print(f"Aliases:      {', '.join(best['aliases'])}")
+    print(f"Best match:   {canonical}")
     print(f"Enterprise:   {ent}")
-    print(f"OID root:     {root}")
-    if best.get("notes"):
-        print(f"Notes:        {best['notes']}")
+    print(f"OID root:     .1.3.6.1.4.1.{ent}")
+    print(f"Raw entry:    {best['raw']}")
 
     print()
-    print("Suggested lld.include_roots entry:")
-    print(f'  - "{root}"')
-
-    slug = slugify(best["canonical"])
-    filter_file = f"filters_{slug}.yaml"
-    print()
-    print("Suggested filter filename:")
-    print(f"  {args.filters_dir}/{filter_file}")
+    print("Suggested LLD include:")
+    print(f'  - ".1.3.6.1.4.1.{ent}"')
 
     if args.write_filter:
-        print()
-        write_filter_file(best, args.filters_dir, force=args.force)
+        write_filter_file(canonical, ent, args.filters_dir, force=args.force)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,23 @@
+Version: 1.0-synology
+
+# Deze file is een EXTENSIE op filters.yaml:
+# - gebruikt dezelfde mib2/vendor regex
+# - voegt Synology-specifieke LLD roots + exacte namen toe
+
+lld:
+  # Velden uit Synology Disk/RAID MIB die we altijd interessant vinden
+  exact_names:
+    - diskStatus
+    - diskTemperature
+    - diskBadSector
+    - diskHealthStatus
+    - diskRemainLife
+    - diskName
+    - raidStatus
+
+  # Extra Synology-tabellen om als LLD te beschouwen
+  include_roots:
+    - ".1.3.6.1.4.1.6574.2"      # Synology Disk MIB (disk tabel)
+    - ".1.3.6.1.4.1.6574.3"      # Synology RAID MIB
+    - ".1.3.6.1.4.1.6574.101"    # Synology Storage I/O MIB (optioneel nuttig)
+

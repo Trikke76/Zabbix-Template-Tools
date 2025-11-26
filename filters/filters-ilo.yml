@@ -1,0 +1,19 @@
+Version: 1.0-ilo
+
+# EXTENSIE op filters.yaml voor HPE iLO / ProLiant health:
+# we focussen op globale health en event log condities
+
+lld:
+  exact_names:
+    - cpqHeMibCondition        # overall server health
+    - cpqHeEventLogCondition   # overall IML/eventlog health
+    - cpqHePowerMeterStatus    # power usage status (optioneel)
+    - cpqHeResMemBoardCondition
+    - cpqHeSysBackupBatteryCondition
+
+  include_roots:
+    - ".1.3.6.1.4.1.232.6.1"      # cpqHeMibRev / cpqHeMibCondition
+    - ".1.3.6.1.4.1.232.6.2.11"   # cpqHeEventLog (eventlog condities + tabel)
+    - ".1.3.6.1.4.1.232.6.2.13"   # cpqHePowerConverter/PowerMeter
+    - ".1.3.6.1.4.1.232.6.2.17"   # battery health, etc.
+

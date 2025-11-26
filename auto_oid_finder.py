@@ -3,7 +3,7 @@
 auto_oid_finder.py
 ==================
 
-Version: 1.0.16
+Version: 1.0.17
 
 Changelog (short)
 -----------------
@@ -29,6 +29,8 @@ Changelog (short)
          subtrees (e.g. .1.3.6.1.4.1.24681) via --root.
 1.0.15: Keep partial data when a walk gives timeout.
 1.0.16: Moved to snmpbulkwalk for performance reasons with fallback to snmpwalk
+1.0.17: From now filters/filters.yaml is always loaded and all includes via
+        --filter-file are merged with it.
 
 Purpose
 -------
@@ -73,7 +75,7 @@ from datetime import datetime, timezone
 
 import yaml
 
-VERSION = "1.0.16"
+VERSION = "1.0.17"
 
 MIB2_ROOT = ".1.3.6.1.2.1"
 VENDOR_ROOT = ".1.3.6.1.4.1"
@@ -87,7 +89,6 @@ DEBUG = False
 
 # Simple cache to avoid calling snmptranslate repeatedly for the same OID
 SNMPTRANSLATE_CACHE: dict[str, tuple[str | None, str | None, str | None]] = {}
-
 
 # ---------------------------------------------------------------------------
 # Logging helpers
@@ -362,31 +363,6 @@ def run_snmpwalk(
     return results
 
 
-    for line in out.splitlines():
-        line = line.strip()
-        if not line or line.startswith("Timeout:"):
-            continue
-
-        if " = " not in line:
-            continue
-        oid_part, rest = line.split(" = ", 1)
-        oid_part = oid_part.strip()
-        rest = rest.strip()
-
-        if ":" in rest:
-            type_part, value_part = rest.split(":", 1)
-            type_part = type_part.strip()
-            value_part = value_part.strip()
-        else:
-            type_part = rest
-            value_part = ""
-
-        results.append((oid_part, type_part, value_part))
-
-    log_info(f"SNMP walk {root_oid} returned {len(results)} OIDs")
-    return results
-
-
 def classify_value_class(snmp_type: str, value: str) -> str:
     """
     Map SNMP type to a coarse value class for Zabbix: UNSIGNED, FLOAT, TEXT.
@@ -586,6 +562,7 @@ def table_is_interesting(
     table: dict,
     columns: list[dict],
     lld_filter_re: re.Pattern | None,
+    lld_exact_names: set[str],
     lld_include_roots: list[str],
     lld_exclude_roots: list[str],
     no_filter: bool,
@@ -616,6 +593,17 @@ def table_is_interesting(
         if root.startswith(p):
             log_debug(f"Keeping table {root} due to lld.include_roots")
             return True
+
+    # Exact-name match on any column (MODULE::name from snmptranslate)
+    for col in columns:
+        name = (col.get("name") or "").strip()
+        if name and name in lld_exact_names:
+            log_debug(
+                f"Keeping table {root} because column '{name}' "
+                f"is in lld.exact_names"
+            )
+            return True
+
 
     if lld_filter_re is None:
         log_debug(f"Dropping table {root} because no LLD regex is defined (strict mode)")
@@ -729,6 +717,7 @@ def build_profile(
     mib2_filter_re: re.Pattern,
     vendor_filter_re: re.Pattern,
     lld_filter_re: re.Pattern,
+    lld_exact_names: set[str],
     lld_include_roots: list[str],
     lld_exclude_roots: list[str],
     no_filter: bool,
@@ -858,6 +847,7 @@ def build_profile(
             table=t,
             columns=cols,
             lld_filter_re=lld_filter_re,
+            lld_exact_names=lld_exact_names,
             lld_include_roots=lld_include_roots,
             lld_exclude_roots=lld_exclude_roots,
             no_filter=no_filter,
@@ -905,6 +895,54 @@ def build_profile(
     }
 
     return profile, stats
+
+def merge_filter_cfg(base: dict, override: dict) -> dict:
+    """
+    Merge two filter configurations:
+      - Sections: mib2, vendor, lld
+      - regex: combine base + override with OR if beide bestaan
+      - include_roots/exclude_roots/exact_names: lijsten samenvoegen (unieke waarden)
+      - andere keys: override wint
+    """
+    result = dict(base)  # shallow copy van de base
+
+    for section in ("mib2", "vendor", "lld"):
+        b_sec = base.get(section) or {}
+        o_sec = override.get(section) or {}
+
+        # start vanuit base-sectie
+        merged_sec = dict(b_sec)
+
+        # niets te overriden? dan gewoon base bewaren
+        if not o_sec:
+            result[section] = merged_sec
+            continue
+
+        for key, o_val in o_sec.items():
+            if key in ("include_roots", "exclude_roots", "exact_names"):
+                # lists samenvoegen, volgorde van base behouden
+                b_list = list(b_sec.get(key) or [])
+                for v in o_val or []:
+                    if v not in b_list:
+                        b_list.append(v)
+                merged_sec[key] = b_list
+
+            elif key == "regex":
+                b_regex = b_sec.get("regex")
+                if b_regex and o_val:
+                    # beide hebben een regex → combineer met OR
+                    merged_sec["regex"] = f"(?:{b_regex})|(?:{o_val})"
+                else:
+                    # één van de twee is leeg → neem de andere
+                    merged_sec["regex"] = o_val or b_regex
+
+            else:
+                # simpele override (vendor-config wint)
+                merged_sec[key] = o_val
+
+        result[section] = merged_sec
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1018,10 +1056,34 @@ def main():
         log_error(f"Filter file '{filter_path}' does not exist.")
         sys.exit(1)
 
-    with open(filter_path, "r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f) or {}
-
     errors: list[str] = []
+
+    script_dir = os.path.dirname(os.path.abspath(filter_path))
+    base_path = os.path.join(script_dir, "filters.yaml")
+
+    # Step 1: ALWAYS load base filters.yaml
+    if not os.path.exists(base_path):
+        log_error(f"Base filter file '{base_path}' does not exist.")
+        sys.exit(1)
+
+    with open(base_path, "r", encoding="utf-8") as f:
+        base_cfg = yaml.safe_load(f) or {}
+    log_info(f"Loaded base filter file: {base_path}")
+
+    # Step 2: If user selected filters.yaml → no extension needed
+    if os.path.abspath(filter_path) == os.path.abspath(base_path):
+        cfg = base_cfg
+        log_info("Using base filters.yaml only (no vendor extension)")
+    else:
+        # Load vendor override file
+        with open(filter_path, "r", encoding="utf-8") as f:
+            vendor_cfg = yaml.safe_load(f) or {}
+        log_info(f"Loaded vendor filter extension: {filter_path}")
+
+        # Merge base + vendor extension
+        cfg = merge_filter_cfg(base_cfg, vendor_cfg)
+        log_info("Successfully merged vendor extension into base filters")
+
 
     # Required top-level sections
     for section in ("mib2", "vendor", "lld"):
@@ -1036,6 +1098,17 @@ def main():
     mib2_cfg = cfg.get("mib2") or {}
     vendor_cfg = cfg.get("vendor") or {}
     lld_cfg = cfg.get("lld") or {}
+    lld_exact_names = set(lld_cfg.get("exact_names") or [])
+
+    if lld_exact_names:
+        log_info(
+            "LLD exact_names: "
+            + ", ".join(sorted(lld_exact_names))
+        )
+    else:
+        log_info("LLD exact_names: (none)")
+
+
 
     # Required keys inside sections
     if "regex" not in mib2_cfg:
@@ -1136,6 +1209,7 @@ def main():
         mib2_filter_re=mib2_filter_re,
         vendor_filter_re=vendor_filter_re,
         lld_filter_re=lld_filter_re,
+        lld_exact_names=lld_exact_names,
         lld_include_roots=lld_include_roots,
         lld_exclude_roots=lld_exclude_roots,
         no_filter=args.no_filter,
