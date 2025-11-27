@@ -3,7 +3,7 @@
 auto_oid_finder.py
 ==================
 
-Version: 1.0.17
+Version: 1.0.18
 
 Changelog (short)
 -----------------
@@ -31,6 +31,9 @@ Changelog (short)
 1.0.16: Moved to snmpbulkwalk for performance reasons with fallback to snmpwalk
 1.0.17: From now filters/filters.yaml is always loaded and all includes via
         --filter-file are merged with it.
+1.0.18: LibreNMS instead of observium + multithread
+
+
 
 Purpose
 -------
@@ -72,17 +75,19 @@ import sys
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 
 import yaml
 
-VERSION = "1.0.17"
+VERSION = "1.0.18"
 
 MIB2_ROOT = ".1.3.6.1.2.1"
 VENDOR_ROOT = ".1.3.6.1.4.1"
 
 DEFAULT_COMMUNITY = "public"
 DEFAULT_PORT = 161
-DEFAULT_TIMEOUT = 2
+DEFAULT_TIMEOUT = 5
 DEFAULT_RETRIES = 1
 
 DEBUG = False
@@ -110,65 +115,80 @@ def log_debug(msg: str):
     if DEBUG:
         print(f"[debug] {msg}")
 
-
 # ---------------------------------------------------------------------------
-# Observium MIBs helpers
+# Externe MIBs helpers (LibreNMS i.p.v. Observium)
 # ---------------------------------------------------------------------------
 
 def ensure_observium_mibs(base_dir: str, force_sync: bool, allow_prompt: bool) -> str | None:
     """
-    Ensure Observium MIB repo exists at base_dir/observium_mibs.
+    Historische naam, maar we gebruiken nu LibreNMS als MIB-bron.
 
-    Returns the path to the MIB directory or None if not present and user
-    opted out.
+    We clonen:
+        https://github.com/librenms/librenms.git
+
+    en gebruiken vervolgens de subdirectory "mibs" als MIBDIRS entry.
+    Returned:
+        pad naar de MIB-directory (meestal <base_dir>/librenms_mibs/mibs)
+        of None als er niets beschikbaar is.
     """
-    repo_dir = os.path.join(base_dir, "observium_mibs")
-    if os.path.isdir(repo_dir):
+    repo_root = os.path.join(base_dir, "librenms_mibs")
+    mib_dir = os.path.join(repo_root, "mibs")
+
+    # Als repo al bestaat → eventueel git pull doen
+    if os.path.isdir(repo_root):
         if force_sync:
-            log_info(f"Updating Observium MIBs in {repo_dir} (git pull)...")
+            log_info(f"Updating LibreNMS MIBs in {repo_root} (git pull)...")
             try:
                 subprocess.run(
-                    ["git", "-C", repo_dir, "pull", "--ff-only"],
+                    ["git", "-C", repo_root, "pull", "--ff-only"],
                     check=True,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
             except Exception as e:
-                log_warn(f"Failed to update Observium MIBs ({e}); using existing clone")
-        return repo_dir
+                log_warn(f"Failed to update LibreNMS MIBs ({e}); using existing clone")
 
-    # Not present
+        # Gebruik bij voorkeur de mibs-subdir, anders de root
+        if os.path.isdir(mib_dir):
+            return mib_dir
+        return repo_root
+
+    # Repo bestaat nog niet
     if not allow_prompt and not force_sync:
-        log_info("Observium MIBs not present and not syncing (no prompt).")
+        log_info("LibreNMS MIBs not present and not syncing (no prompt).")
         return None
 
-    # Ask user
+    # Interactief vragen of we mogen clonen
     while True:
         ans = input(
-            "[prompt] Sync/update Observium MIB library in ./observium_mibs "
+            "[prompt] Sync/update LibreNMS MIB library in ./librenms_mibs "
             "(for name enrichment)? [Y/n]: "
         ).strip().lower()
         if ans in ("", "y", "yes"):
-            log_info(f"Cloning Observium MIBs into {repo_dir}...")
+            log_info(f"Cloning LibreNMS repo into {repo_root}...")
             try:
                 subprocess.run(
                     [
                         "git",
                         "clone",
-                        "https://github.com/linuxmail/observium-mibs.git",
-                        repo_dir,
+                        "--depth", "1",
+                        "https://github.com/librenms/librenms.git",
+                        repo_root,
                     ],
                     check=True,
                 )
-                return repo_dir
+                if os.path.isdir(mib_dir):
+                    return mib_dir
+                return repo_root
             except Exception as e:
-                log_error(f"Failed to clone Observium MIBs: {e}")
+                log_error(f"Failed to clone LibreNMS repo: {e}")
                 return None
         elif ans in ("n", "no"):
-            log_info("User opted not to sync Observium MIBs.")
+            log_info("User opted not to sync LibreNMS MIBs.")
             return None
         else:
             print("Please answer Y or n.")
+
 
 
 def snmptranslate_enrich(
@@ -256,12 +276,6 @@ def snmptranslate_enrich(
 
 
 # ---------------------------------------------------------------------------
-# SNMP walk via net-snmp snmpwalk
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# SNMP walk via net-snmp snmpwalk / snmpbulkwalk
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
 # SNMP walk via net-snmp snmpwalk / snmpbulkwalk
 # ---------------------------------------------------------------------------
 def run_snmpwalk(
@@ -278,15 +292,11 @@ def run_snmpwalk(
     Run snmpwalk (or snmpbulkwalk when use_bulk=True) and return a list of
     (oid, type, value) tuples.
 
-    Argument order matches the original call sites:
-
-        run_snmpwalk(host, community, root_oid, port, timeout, retries,
-                     suppress_errors=suppress, use_bulk=use_bulk)
-
     Behaviour:
       - If use_bulk=True, use snmpbulkwalk with -Cn0 -Cr50.
       - Do NOT raise on non-zero exit codes; parse what we can.
       - Filter out timeout / end-of-MIB messages from output.
+      - NEW: if bulkwalk returns no OIDs, automatically retry with snmpwalk.
     """
     tool = "snmpbulkwalk" if use_bulk else "snmpwalk"
 
@@ -301,9 +311,8 @@ def run_snmpwalk(
 
     if use_bulk:
         # 0 non-repeaters, 50 max-repetitions is a decent default
-        cmd.extend(["-Cn0", "-Cr50"])
+        cmd.extend(["-Cn0", "-Cr25"])
 
-    # host:port and root oid
     cmd.extend([f"{host}:{port}", root_oid])
 
     log_info(f"SNMP walk {root_oid} on {host}:{port}...")
@@ -352,6 +361,25 @@ def run_snmpwalk(
             value_part = rest.strip()
 
         results.append((oid_part, type_part, value_part))
+
+    # NEW: fallback als bulkwalk faalt
+    if use_bulk and not results:
+        if err and not suppress_errors:
+            log_warn(
+                f"Bulk SNMP walk for {root_oid} on {host}:{port} returned no data "
+                f"(exit {proc.returncode}: {err}); retrying with snmpwalk..."
+            )
+        # Eén keer opnieuw proberen met normale walk
+        return run_snmpwalk(
+            host=host,
+            community=community,
+            root_oid=root_oid,
+            port=port,
+            timeout=timeout,
+            retries=retries,
+            suppress_errors=suppress_errors,
+            use_bulk=False,
+        )
 
     if not results and err and not suppress_errors:
         log_error(
@@ -722,6 +750,7 @@ def build_profile(
     lld_exclude_roots: list[str],
     no_filter: bool,
     use_bulk: bool,
+    threads: int,
 ) -> tuple[dict, dict]:
     """
     Walk the given roots, collect OIDs, figure out scalars and tables,
@@ -734,10 +763,12 @@ def build_profile(
     all_results: list[tuple[str, str, str]] = []
     vendor_root_failed = False
 
-    # First, walk the main roots (.1.3.6.1.2.1 and .1.3.6.1.4.1 plus extras)
-    for root in roots:
-        # Only the vendor root can be "soft-failed" but we still want to
-        # detect that failure so we can later try narrower include_roots.
+    def _walk_one(root: str) -> tuple[str, list[tuple[str, str, str]]]:
+        """
+        Helper to walk a single root OID.
+
+        Returns (root, results).
+        """
         suppress = (root == VENDOR_ROOT)
         res = run_snmpwalk(
             host,
@@ -749,14 +780,37 @@ def build_profile(
             suppress_errors=suppress,
             use_bulk=use_bulk,
         )
-        if not res and root == VENDOR_ROOT:
-            vendor_root_failed = True
-            log_warn(
-                "Vendor root walk (.1.3.6.1.4.1) returned no data; "
-                "will attempt dedicated walks for each lld.include_roots "
-                "subtree under .1.3.6.1.4.1."
-            )
-        all_results.extend(res)
+        return root, res
+
+    # First, walk the main roots (.1.3.6.1.2.1 and vendor/include_roots/extra --root)
+    if threads <= 1 or len(roots) == 1:
+        # Fallback: sequentieel (oude gedrag)
+        for root in roots:
+            root_id, res = _walk_one(root)
+            if not res and root_id == VENDOR_ROOT:
+                vendor_root_failed = True
+                log_warn(
+                    "Vendor root walk (.1.3.6.1.4.1) returned no data; "
+                    "will attempt dedicated walks for each lld.include_roots "
+                    "subtree under .1.3.6.1.4.1."
+                )
+            all_results.extend(res)
+    else:
+        # Parallel walks per root
+        max_workers = min(max(1, threads), len(roots))
+        log_info(f"Running SNMP walks in parallel with {max_workers} threads")
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_walk_one, r): r for r in roots}
+            for fut in as_completed(futures):
+                root_id, res = fut.result()
+                if not res and root_id == VENDOR_ROOT:
+                    vendor_root_failed = True
+                    log_warn(
+                        "Vendor root walk (.1.3.6.1.4.1) returned no data; "
+                        "will attempt dedicated walks for each lld.include_roots "
+                        "subtree under .1.3.6.1.4.1."
+                    )
+                all_results.extend(res)
 
     # If vendor root walk failed, try each include_roots subtree under .1.3.6.1.4.1
     if vendor_root_failed:
@@ -1035,6 +1089,12 @@ def main():
         action="store_true",
         help="Use snmpbulkwalk instead of snmpwalk for faster bulk retrieval (SNMP v2c)",
     )
+    parser.add_argument(
+        "--threads",
+        type=int,
+        default=4,
+        help="Number of parallel SNMP walks (per root). Default: 4",
+    )
 
     pre_args, _ = parser.parse_known_args()
     if pre_args.version:
@@ -1191,9 +1251,9 @@ def main():
             allow_prompt=True,
         )
         if observium_dir:
-            log_info(f"Observium MIBs will be used from: {observium_dir}")
+            log_info(f"LibreNMS MIBs will be used from: {observium_dir}")
         else:
-            log_info("Observium MIBs not available; enrichment will be limited.")
+            log_info("LibreNMS MIBs not available; enrichment will be limited.")
 
     out_path = make_output_path(args.host, args.output)
 
@@ -1214,6 +1274,7 @@ def main():
         lld_exclude_roots=lld_exclude_roots,
         no_filter=args.no_filter,
         use_bulk=args.snmp_bulk,
+        threads=args.threads,
     )
     elapsed = time.time() - t0
 

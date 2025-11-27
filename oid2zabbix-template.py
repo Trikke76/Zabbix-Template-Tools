@@ -3,7 +3,7 @@
 oid2zabbix-template.py
 ======================
 
-Version: 1.0.17
+Version: 1.0.18
 
 Take an auto_oid_finder profile YAML and turn it into a Zabbix 7.0 template.
 
@@ -50,7 +50,7 @@ import uuid
 
 import yaml
 
-VERSION = "1.0.17"
+VERSION = "1.0.18"
 
 ZABBIX_EXPORT_VERSION = "7.0"
 
@@ -496,7 +496,6 @@ def _pick_name_column(columns: list[dict]) -> tuple[str | None, str | None]:
 
     return prefix, macro_key
 
-
 def make_table_lld(table: dict) -> tuple[list[dict], dict]:
     """
     Build master SNMP walk item + discovery rule for a given table entry.
@@ -507,7 +506,8 @@ def make_table_lld(table: dict) -> tuple[list[dict], dict]:
       key:      snmp.raw.walk[1_3_6_1_2_1_25_3_3_1]
       snmp_oid: walk[.1.3.6.1.2.1.25.3.3.1]
 
-    We only put the table root OID in walk[] to avoid snmp_oid being too long.
+    We put the table root OID in walk[] and use a JavaScript preprocessing
+    step to turn the raw snmpwalk output into LLD JSON.
     """
     root_oid = table.get("root_oid")
     if not root_oid:
@@ -521,8 +521,12 @@ def make_table_lld(table: dict) -> tuple[list[dict], dict]:
     # Build a friendly label for UI names
     table_label = _friendly_table_label(root_oid, columns)
 
-    # Try to pick a "name" column for macros
+    # Try to pick a "name" column for macros (e.g. {#HDDESCR}, {#IFDESCR})
     name_col_prefix, macro_key = _pick_name_column(columns)
+
+    # Build the robust JS parser that:
+    #   - altijd {#SNMPINDEX} maakt (laatste OID-segment)
+    #   - optioneel een naam macro vult (bijv. {#HDDESCR})
     js_script = _build_lld_js(name_col_prefix, macro_key)
 
     # Safe root ID for discovery key
@@ -548,6 +552,7 @@ def make_table_lld(table: dict) -> tuple[list[dict], dict]:
 
     desc = "\n".join(desc_lines)
 
+    # Master item: raw snmpwalk text
     master_item = {
         "uuid": uuid.uuid4().hex,
         "name": f"RAW SNMP walk for {table_label}",
@@ -564,6 +569,7 @@ def make_table_lld(table: dict) -> tuple[list[dict], dict]:
         ],
     }
 
+    # Discovery rule: JS → LLD JSON, plus heartbeat
     dr = {
         "uuid": uuid.uuid4().hex,
         "name": f"Auto LLD for {table_label}",
@@ -586,6 +592,7 @@ def make_table_lld(table: dict) -> tuple[list[dict], dict]:
         "trigger_prototypes": [],
     }
 
+    # Item prototypes per kolom
     for col in columns:
         prefix = col.get("prefix")
         if not prefix:
@@ -605,15 +612,15 @@ def make_table_lld(table: dict) -> tuple[list[dict], dict]:
         else:
             base_name = prefix
 
-        # Clean prototype name:
-        # - If we have a name macro: IF-MIB::ifInOctets [eth0]
-        # - Otherwise: IF-MIB::ifInOctets [{#SNMPINDEX}]
+        # Prototype naam:
+        # - met macro:  IF-MIB::ifDescr [eth0]
+        # - zonder macro: IF-MIB::ifDescr [{#SNMPINDEX}]
         if macro_key:
             proto_name = f"{base_name} [{macro_key}]"
         else:
             proto_name = f"{base_name} [{{#SNMPINDEX}}]"
 
-
+        # SNMP OID per rij
         col_snmp_oid = f"{prefix}.{{#SNMPINDEX}}"
         proto_key = build_column_key(col, root_oid)
 
@@ -628,6 +635,7 @@ def make_table_lld(table: dict) -> tuple[list[dict], dict]:
             else:
                 full_desc = block
 
+        # Let op: hier blijven we gewoon SNMP_AGENT + get[...] gebruiken.
         proto = {
             "uuid": uuid.uuid4().hex,
             "name": proto_name,
@@ -646,6 +654,7 @@ def make_table_lld(table: dict) -> tuple[list[dict], dict]:
         dr["item_prototypes"].append(proto)
 
     return [master_item], dr
+
 
 
 def _norm_oid(oid: str) -> str:

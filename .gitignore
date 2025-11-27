@@ -1,5 +1,6 @@
 venv
 observium_mibs/
+librenms_mibs/
 mibs/
 export_template/
 export_yaml/
