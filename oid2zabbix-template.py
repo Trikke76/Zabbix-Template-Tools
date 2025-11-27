@@ -3,7 +3,7 @@
 oid2zabbix-template.py
 ======================
 
-Version: 1.0.16
+Version: 1.0.17
 
 Take an auto_oid_finder profile YAML and turn it into a Zabbix 7.0 template.
 
@@ -50,7 +50,7 @@ import uuid
 
 import yaml
 
-VERSION = "1.0.16"
+VERSION = "1.0.17"
 
 ZABBIX_EXPORT_VERSION = "7.0"
 
@@ -306,13 +306,12 @@ def _build_lld_js(name_col_prefix: str | None, macro_key: str | None) -> str:
     """
     Build the per-table LLD JavaScript.
 
-    This version is more forgiving:
-      - does NOT rely on a strict regex for the OID
-      - works with raw numeric output like:
+    Deze versie:
+      - gebruikt GEEN Array.prototype.filter (compatibel met Duktape)
+      - blijft werken met ruwe numeric output zoals:
           .1.3.6.1.2.1.2.2.1.2.2 = STRING: "eth0"
-      - still:
-          * always extracts {#SNMPINDEX}
-          * optionally extracts a name macro (e.g. {#IFDESCR})
+      - extraheert altijd {#SNMPINDEX}
+      - optioneel een naam-macro (bijv. {#IFDESCR})
     """
     lines: list[str] = []
 
@@ -352,29 +351,35 @@ for (var i = 0; i < lines.length; i++) {
     var oidPart = line.substring(0, eqPos).trim();
     var rest = line.substring(eqPos + 3).trim(); // after " = "
 
-    // Normalize OID: if it ever has a MIB name, strip it, but
-    // in your case it's already numeric (.1.3.6....)
+    // Normalize OID: if it ever has a MIB name, strip it
     var oidNorm = oidPart;
     var dbl = oidNorm.indexOf("::");
     if (dbl !== -1) {
         oidNorm = oidNorm.substring(dbl + 2);
     }
 
-    // Split on '.' and take the last numeric segment as index
-    var parts = oidNorm.split(".").filter(function(p) { return p.length > 0; });
+    // Split on '.' en zelf lege stukjes wegfilteren (geen Array.filter)
+    var rawParts = oidNorm.split(".");
+    var parts = [];
+    for (var j = 0; j < rawParts.length; j++) {
+        if (rawParts[j].length > 0) {
+            parts.push(rawParts[j]);
+        }
+    }
     if (parts.length < 1) {
         continue;
     }
 
+    // Laatste numerieke segment is de index
     var index = parts[parts.length - 1];
     if (!/^\\d+$/.test(index)) {
         continue;
     }
 
-    // Record that we saw this index
+    // Record dat we deze index gezien hebben
     indexMap[index] = true;
 
-    // Parse value, strip "TYPE: " and quotes
+    // Parse value, strip "TYPE: " en quotes
     var rawVal = rest;
     var mt = rest.match(/^[A-Z0-9\\-]+:\\s*(.*)$/);
     if (mt) {
@@ -382,7 +387,7 @@ for (var i = 0; i < lines.length; i++) {
     }
     rawVal = rawVal.replace(/^"(.*)"$/, "$1");
 
-    // If this OID belongs to the chosen "name" column, store name
+    // Als dit OID bij de gekozen naam-kolom hoort, sla de naam op
     if (NAME_COL_PREFIX) {
         // NAME_COL_PREFIX is numeric (e.g. ".1.3.6.1.2.1.2.2.1.2")
         if (oidPart.indexOf(NAME_COL_PREFIX + ".") === 0 ||
@@ -399,7 +404,7 @@ for (var i = 0; i < lines.length; i++) {
         """
 var data = [];
 for (var idx in indexMap) {
-    if (!indexMap.hasOwnProperty(idx)) {
+    if (!Object.prototype.hasOwnProperty.call(indexMap, idx)) {
         continue;
     }
     var row = { "{#SNMPINDEX}": idx };
@@ -414,6 +419,7 @@ return JSON.stringify({ "data": data });
     )
 
     return "".join(lines)
+
 
 # ---------------------------------------------------------------------------
 # Table → LLD builder
