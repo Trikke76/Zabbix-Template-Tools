@@ -7,6 +7,7 @@ Version: 1.0
 # This file extends filters.yaml. Only vendor-specific parts need to be included.
 
 lld:
+  # Make sure we walk this vendor subtree for LLD
   include_roots:
     - ".1.3.6.1.4.1.9"
 
