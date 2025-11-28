@@ -3,7 +3,7 @@
 oid2zabbix-template.py
 ======================
 
-Version: 1.0.18
+Version: 1.0.19
 
 Take an auto_oid_finder profile YAML and turn it into a Zabbix 7.0 template.
 
@@ -50,7 +50,7 @@ import uuid
 
 import yaml
 
-VERSION = "1.0.18"
+VERSION = "1.0.19"
 
 ZABBIX_EXPORT_VERSION = "7.0"
 
@@ -103,6 +103,98 @@ def normalize_value_type(value_class: str) -> str:
         return "CHAR"
     return "TEXT"
 
+# ---------------------------------------------------------------------------
+# Traffic counter detection / preprocessing
+# ---------------------------------------------------------------------------
+
+def _looks_like_traffic_counter(name: str | None,
+                                sample_type: str | None,
+                                value_class: str | None) -> bool:
+    """
+    Heuristic: decide if an item looks like a byte/octet traffic counter
+    that we want to turn into bits per second.
+
+    We keep this conservative: only obvious ifIn/ifOut/netIfIn/netIfOut
+    style counters, not errors/discards.
+    """
+    if not name:
+        return False
+
+    n = name.lower()
+
+    # We only want throughput, not errors/discards
+    exclude_fragments = [
+        "error", "errors",
+        "discard", "discards",
+        "unknown",
+        "ucast", "unicast",
+        "bcast", "broadcast",
+        "mcast", "multicast",
+    ]
+    if any(frag in n for frag in exclude_fragments):
+        return False
+
+    # Classic traffic counters
+    traffic_fragments = [
+        "ifinoctets",
+        "ifoutoctets",
+        "ifhcinoctets",
+        "ifhcoutoctets",
+        "netifin",
+        "netifout",
+        "octetsin",
+        "octetsout",
+        "bytesin",
+        "bytesout",
+    ]
+    if not any(frag in n for frag in traffic_fragments):
+        return False
+
+    # Optional type sanity checks
+    st = (sample_type or "").upper()
+    vc = (value_class or "").upper()
+
+    # Accept Counter32/Counter64 or unsigned counters
+    if (
+        "COUNTER" in st
+        or vc in ("UNSIGNED", "COUNTER", "GAUGE")
+    ):
+        return True
+
+    return False
+
+
+def _apply_traffic_preprocessing(item: dict,
+                                 name: str | None,
+                                 sample_type: str | None,
+                                 value_class: str | None) -> None:
+    """
+    If this item looks like a traffic counter (bytes/octets in/out),
+    add:
+      - CHANGE_PER_SECOND
+      - MULTIPLIER 8
+      - units = bps
+    """
+    if not _looks_like_traffic_counter(name, sample_type, value_class):
+        return
+
+    # Preprocessing chain
+    pp = item.setdefault("preprocessing", [])
+    pp.append(
+        {
+            "type": "CHANGE_PER_SECOND",
+            "parameters": [""],
+        }
+    )
+    pp.append(
+        {
+            "type": "MULTIPLIER",
+            "parameters": ["8"],
+        }
+    )
+
+    # Units: bits per second (change to "Bps" if you really want bytes/s)
+    item["units"] = "bps"
 
 def safe_template_filename(template_name: str) -> str:
     """
@@ -269,6 +361,14 @@ def make_scalar_item(entry: dict) -> dict:
 
     if full_desc:
         item["description"] = full_desc
+
+    # Auto-traffic preprocessing for obvious in/out octet counters
+    _apply_traffic_preprocessing(
+        item=item,
+        name=name,
+        sample_type=sample_type,
+        value_class=value_class,
+    )
 
     return item
 
@@ -650,6 +750,14 @@ def make_table_lld(table: dict) -> tuple[list[dict], dict]:
 
         if full_desc:
             proto["description"] = full_desc
+
+        # Auto-traffic preprocessing for table counters (e.g. ifInOctets/ifOutOctets)
+        _apply_traffic_preprocessing(
+            item=proto,
+            name=name,
+            sample_type=sample_type,
+            value_class=value_class,
+        )
 
         dr["item_prototypes"].append(proto)
 

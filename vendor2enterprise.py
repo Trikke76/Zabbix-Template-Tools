@@ -3,7 +3,7 @@
 vendor2enterprise.py
 ====================
 
-Version: 1.0.3
+Version: 1.0.6
 
 Helper tool to map vendor names to IANA enterprise numbers and optionally
 generate a filters/filters-<vendor>.yml file suitable for auto_oid_finder.py.
@@ -26,10 +26,17 @@ import argparse
 import os
 import re
 import sys
+import json
 from dataclasses import dataclass, field
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Set
+from pathlib import Path
+from glob import glob
+import urllib.request
 
 IANA_CACHE_PATH = "data/iana_enterprise_numbers.txt"
+IANA_ENTERPRISE_URL = (
+    "https://www.iana.org/assignments/enterprise-numbers/enterprise-numbers"
+)
 
 # ---------------------------------------------------------------------------
 # Vendor profiles (override IANA behaviour for some vendors)
@@ -144,6 +151,33 @@ def load_iana_cache(path: str) -> List[str]:
     with open(path, "r", encoding="utf-8") as f:
         return f.read().splitlines()
 
+def download_iana_cache(path: str) -> bool:
+    """
+    Try to download the IANA enterprise-numbers file and save it to `path`.
+
+    Returns True on success, False on failure.
+    """
+    try:
+        print(f"[info] Downloading IANA enterprise list from:")
+        print(f"       {IANA_ENTERPRISE_URL}")
+
+        # Ensure directory exists (e.g. data/)
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+
+        with urllib.request.urlopen(IANA_ENTERPRISE_URL, timeout=20) as resp:
+            content = resp.read().decode("utf-8", errors="replace")
+
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+
+        print(f"[info] Saved IANA cache to: {path}")
+        return True
+    except Exception as e:
+        print(f"[error] Failed to download IANA enterprise list: {e}")
+        return False
+
 
 @dataclass
 class IanaEntry:
@@ -181,28 +215,55 @@ def parse_iana_entries(lines: List[str]) -> List[IanaEntry]:
 
     return entries
 
-
 def find_iana_matches(entries: List[IanaEntry], query: str) -> List[IanaEntry]:
     q = query.lower().strip()
     scored: List[tuple[int, IanaEntry]] = []
+
+    # Generieke "oninteressante" woorden in vendor-namen
+    STOPWORDS = {
+        "inc", "inc.", "ltd", "ltd.", "corp", "corp.",
+        "co", "co.", "company", "companies",
+        "systems", "system",
+        "technologies", "technology", "tech",
+        "international", "intl", "global",
+        "group", "holding", "holdings",
+        "sa", "ag", "gmbh", "sarl", "bv", "nv",
+    }
+
+    # Tokenizer helper
+    def tokenize(s: str) -> set[str]:
+        tokens = re.split(r"[^a-z0-9]+", s.lower())
+        return {
+            t for t in tokens
+            if t and len(t) >= 3 and t not in STOPWORDS
+        }
+
+    q_tokens = tokenize(q)
+
     for e in entries:
         name = e.name.lower()
         score = 0
+
+        # Sterkste signalen eerst
         if q == name:
             score = 4
         elif q in name:
             score = 3
         elif name in q:
             score = 2
-        # very weak signal: word overlap
-        elif any(tok and tok in name for tok in q.split()):
-            score = 1
+        else:
+            # Zwakke maar nuttige match: token-overlap (zonder stopwoorden)
+            name_tokens = tokenize(name)
+            if q_tokens and name_tokens:
+                if q_tokens & name_tokens:
+                    score = 1
 
         if score > 0:
             scored.append((score, e))
 
     scored.sort(key=lambda x: (-x[0], x[1].enterprise))
     return [x[1] for x in scored]
+
 
 
 def find_iana_by_enterprise(entries: List[IanaEntry], ent: int) -> Optional[IanaEntry]:
@@ -215,6 +276,18 @@ def find_iana_by_enterprise(entries: List[IanaEntry], ent: int) -> Optional[Iana
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+def classify_symbol_case(name: str) -> str:
+    """
+    Classify SNMP symbol names by typical MIB naming conventions.
+    """
+    if name.isupper():
+        return "ALLCAPS"       # usually enums or constants → low value
+    if "_" in name:
+        return "SNAKE"         # often internal, sometimes useful → medium
+    if re.match(r"^[a-z]+[A-Z][A-Za-z0-9]*$", name):
+        return "CAMEL"         # classic table/column names → highest value
+    return "OTHER"
+
 
 def slugify(name: str) -> str:
     s = name.lower()
@@ -292,19 +365,28 @@ def generate_profile_filter_yaml(profile: VendorProfile) -> str:
 
     # vendor.regex
     vendor_regex = profile.vendor_regex or GENERIC_VENDOR_REGEX
+    json_str = json.dumps(vendor_regex)
     lines.append("\nvendor:\n")
     lines.append("  # Vendor-specific regex (can be extended in filters.yaml)\n")
-    lines.append(f'  regex: "{vendor_regex}"\n')
+    lines.append(f"  regex: {json_str}\n")
 
     return "".join(lines)
 
-
-def generate_generic_filter_yaml(ent: int, name: str) -> str:
+def generate_generic_filter_yaml(
+    ent: int,
+    name: str,
+    vendor_regex: Optional[str] = None,
+) -> str:
     """
     Very generic vendor extension: just include the vendor root and
     a broad hardware/health regex.
+
+    If vendor_regex is provided (e.g. built from MIBs), use that; otherwise
+    fall back to GENERIC_VENDOR_REGEX.
     """
     root = enterprise_root(ent)
+    regex = vendor_regex or GENERIC_VENDOR_REGEX
+
     return (
         "Version: 1.0\n\n"
         f"# Vendor: {name}\n"
@@ -322,8 +404,9 @@ def generate_generic_filter_yaml(ent: int, name: str) -> str:
         "    []\n\n"
         "vendor:\n"
         "  # Vendor-specific regex (can be extended in filters.yaml)\n"
-        f"  regex: \"{GENERIC_VENDOR_REGEX}\"\n"
+        f"  regex: \"{regex}\"\n"
     )
+
 
 
 # ---------------------------------------------------------------------------
@@ -340,6 +423,165 @@ def choose_profile(query: str) -> Optional[VendorProfile]:
         return PROFILES["cisco"]
     return None
 
+def collect_mib_paths(mib_files: List[str], mib_dirs: List[str]) -> List[str]:
+    """
+    Resolve a combined list of MIB files from explicit --mib and --mib-dir
+    arguments. Directories are scanned for case-insensitive *.mib and *.txt
+    files (e.g. QNAP-NAS-MIB.MIB will be picked up).
+
+    Returns a de-duplicated list of file paths.
+    """
+    paths: List[str] = []
+
+    # Explicit files
+    for p in mib_files:
+        if not p:
+            continue
+        candidate = Path(p)
+        if candidate.is_file():
+            paths.append(str(candidate))
+        else:
+            print(f"[warn] MIB file not found: {p}")
+
+    # Directories
+    for d in mib_dirs:
+        if not d:
+            continue
+        base = Path(d)
+        if not base.is_dir():
+            print(f"[warn] MIB dir not found: {d}")
+            continue
+
+        # Case-insensitive patterns for .mib / .txt
+        for pattern in ("*.mib", "*.MIB", "*.txt", "*.TXT"):
+            for f in base.glob(pattern):
+                if f.is_file():
+                    paths.append(str(f))
+
+    # De-duplicate while preserving order
+    seen: set[str] = set()
+    uniq: List[str] = []
+    for p in paths:
+        if p in seen:
+            continue
+        seen.add(p)
+        uniq.append(p)
+
+    return uniq
+
+def extract_mib_symbols(mib_paths: List[str]) -> Set[str]:
+    """
+    Very lightweight MIB "parser": we just scan for lines that look like
+
+        someObjectName   OBJECT-TYPE
+
+    and collect 'someObjectName' as a symbol.
+
+    This is intentionally simple and robust: we don't depend on pysmi
+    here, just text scanning.
+    """
+    symbols: Set[str] = set()
+    for path in mib_paths:
+        try:
+            text = Path(path).read_text(encoding="utf-8", errors="ignore")
+        except Exception as e:
+            print(f"[warn] Failed to read MIB {path}: {e}")
+            continue
+
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("--"):
+                continue
+            # crude: look for 'NAME OBJECT-TYPE'
+            m = re.match(r"^([A-Za-z0-9][A-Za-z0-9_-]*)\s+OBJECT-TYPE\b", line)
+            if m:
+                symbols.add(m.group(1))
+
+    return symbols
+
+
+def build_vendor_regex_from_symbols(symbols: Set[str]) -> Optional[str]:
+    """
+    Build a vendor.regex string from a set of MIB symbol names.
+
+    Strategy:
+      - Start with a generic core of useful words.
+      - Add symbol names that look interesting.
+      - Keep it bounded so the regex doesn't explode.
+
+    Returns a '(a|b|c)' style regex string, or None if nothing usable.
+    """
+    if not symbols:
+        return None
+
+    # Generic base words we always like to have
+    generic_words = [
+        "disk", "hdd", "ssd", "raid", "array", "lun", "volume", "pool",
+        "storage", "psu", "power", "watt", "volt", "voltage", "current",
+        "amp", "amps", "temp", "temperature", "thermal", "fan", "rpm",
+        "status", "state", "health", "error", "fail", "failed", "fault",
+        "alarm", "alert", "critical", "cpu", "mem", "memory", "cache",
+        "latency", "iops"
+    ]
+
+    # Heuristic scoring: prefer symbols containing these fragments
+    interesting_fragments = [
+        "disk", "vol", "volume", "snap", "raid", "array", "pool",
+        "fan", "temp", "temperature", "sensor", "psu", "power",
+        "latency", "iops", "cache", "health", "status", "error"
+    ]
+
+    scored: list[tuple[int, str]] = []
+
+    for sym in symbols:
+        name = sym.strip()
+        if not name:
+            continue
+        if len(name) > 50:
+            continue
+
+        lname = name.lower()
+
+        score = 0
+
+        # fragment scoring
+        for frag in interesting_fragments:
+            if frag in lname:
+                score += 2
+
+        # short names are often good table names
+        if len(name) <= 12:
+            score += 1
+
+        # NEW: Case classification weight
+        case = classify_symbol_case(name)
+        if case == "CAMEL":
+            score += 5
+        elif case == "SNAKE":
+            score += 2
+        elif case == "ALLCAPS":
+            score -= 3   # enums/constants → suppress
+        # OTHER = neutral
+
+        scored.append((score, name))
+
+    scored.sort(key=lambda x: (-x[0], x[1].lower()))
+
+    TOP_N = 80
+    selected_symbols = [name for score, name in scored[:TOP_N] if score > 0]
+
+    if not selected_symbols:
+        selected_symbols = [name for score, name in scored[:20]]
+
+    parts = set(generic_words)
+    parts.update(selected_symbols)
+
+    parts_sorted = sorted(parts)
+
+    # escape regex parts
+    safe_parts = [re.escape(p) for p in parts_sorted]
+
+    return "(" + "|".join(safe_parts) + ")"
 
 def write_filter_file(
     vendor_name: str,
@@ -347,15 +589,27 @@ def write_filter_file(
     vendor_profile: Optional[VendorProfile],
     filters_dir: str,
     force: bool,
+    vendor_regex: Optional[str] = None,
 ) -> str:
+    """
+    Write the vendor filter file.
+
+    - If vendor_profile is present, we optionally override its vendor_regex
+      with the MIB-derived vendor_regex (if provided).
+    - If no profile, we pass vendor_regex directly into the generic generator.
+    """
     os.makedirs(filters_dir, exist_ok=True)
 
     if vendor_profile:
+        # If we built a regex from MIBs, inject it into the profile
+        if vendor_regex is not None:
+            vendor_profile.vendor_regex = vendor_regex
+
         content = generate_profile_filter_yaml(vendor_profile)
         slug = vendor_profile.key
         filename = f"filters-{slug}.yml"
     else:
-        content = generate_generic_filter_yaml(ent, vendor_name)
+        content = generate_generic_filter_yaml(ent, vendor_name, vendor_regex=vendor_regex)
         slug = slugify(vendor_name)
         filename = f"filters-{slug}.yml"
 
@@ -392,6 +646,18 @@ def main():
         help="Directory where filter files are stored (default: filters).",
     )
     parser.add_argument(
+        "--mib",
+        action="append",
+        default=[],
+        help="MIB file to mine for vendor-specific keywords (can be repeated)"
+    )
+    parser.add_argument(
+        "--mib-dir",
+        action="append",
+        default=[],
+        help="Directory containing MIB files (*.mib, *.txt) to mine for vendor-specific keywords (can be repeated)"
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
         help="Overwrite existing filter file if it already exists.",
@@ -400,12 +666,21 @@ def main():
     args = parser.parse_args()
     query = " ".join(args.vendor_name).strip()
 
-    # Load IANA cache
+    # Load IANA cache (auto-download if missing/empty)
     lines = load_iana_cache(IANA_CACHE_PATH)
     if not lines:
-        print(f"[error] No IANA cache found at: {IANA_CACHE_PATH}")
-        print("        Download enterprise-numbers from IANA and store it there.")
+        print(f"[warn] No IANA cache found or file is empty: {IANA_CACHE_PATH}")
+        print("       Attempting to download enterprise-numbers from IANA...")
+        if download_iana_cache(IANA_CACHE_PATH):
+            lines = load_iana_cache(IANA_CACHE_PATH)
+
+    if not lines:
+        print(f"[error] Unable to load IANA enterprise list.")
+        print(f"        Tried: {IANA_CACHE_PATH}")
+        print("        You can also download it manually from:")
+        print("          https://www.iana.org/assignments/enterprise-numbers/")
         sys.exit(1)
+
 
     print(f"[info] Using existing IANA cache: {IANA_CACHE_PATH}")
     entries = parse_iana_entries(lines)
@@ -444,7 +719,33 @@ def main():
         print(f"OID root:     {root}")
         print(f"Raw entry:    {best.name}")
 
+    # ------------------------------------------------------------------
+    # Optional: mine MIBs for vendor-specific symbols to build vendor.regex
+    # ------------------------------------------------------------------
+    mib_paths = collect_mib_paths(args.mib, args.mib_dir)
+    vendor_regex: Optional[str] = None
+
+    if mib_paths:
+        print("[info] Mining MIBs for vendor-specific keywords:")
+        for p in mib_paths:
+            print(f"       - {p}")
+
+        symbols = extract_mib_symbols(mib_paths)
+        if symbols:
+            print(f"[info] Found {len(symbols)} MIB symbols")
+            vr = build_vendor_regex_from_symbols(symbols)
+            if vr:
+                vendor_regex = vr
+                print(f"[info] Built vendor.regex from MIBs (length {len(vr)})")
+            else:
+                print("[warn] No useful regex built from MIBs; using generic vendor.regex")
+        else:
+            print("[warn] No symbols found in MIBs; using generic vendor.regex")
+    else:
+        print("[info] No MIBs provided; using generic vendor.regex")
+
     print()
+
     print("Suggested LLD include:")
     print(f'  - "{enterprise_root(ent)}"')
     if profile and profile.extra_enterprises:
@@ -465,6 +766,7 @@ def main():
             vendor_profile=profile,
             filters_dir=args.filters_dir,
             force=args.force,
+            vendor_regex=vendor_regex,
         )
 
 

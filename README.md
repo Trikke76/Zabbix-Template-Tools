@@ -50,7 +50,7 @@ Optional:
 
     export_yaml/                     # Scanner output
     export_template/                 # Zabbix templates
-    observium_mibs/                  # Optional MIB repo (auto-managed)
+    LibreNMS_mibs/                   # Optional MIB repo (auto-managed)
 
 ---
 
@@ -213,7 +213,7 @@ Output YAML goes into export_yaml/, for example:
 
     ./oid2zabbix-template.py \
         export_yaml/auto_oid_192.168.0.107_*.yaml \
-        --name "Template SNMP QNAP"
+        --name "Template SNMP QNAP" --mib librenms_mibs/mibs/qnap/QNAP-NAS-MIB
 
 Templates are saved under export_template/.
 
@@ -231,7 +231,7 @@ Templates are saved under export_template/.
   - Scalars (OIDs ending in .0)
   - Tables (heuristic multi-index patterns)
 - Enriches:
-  - module/name/description via snmptranslate and optional Observium MIBs
+  - module/name/description via snmptranslate and optional LibreNMS MIBs
 - Filters:
   - Scalars using mib2.regex / vendor.regex
   - Tables using lld.regex / lld.include_roots / lld.exclude_roots
@@ -350,6 +350,8 @@ vendor:
 
 ```
 ./vendor2enterprise.py qnap --write-filter
+      --mib                         Point to a MIB file to search for enrichment
+      --mib-dir                     Point to a folder with MIB files to search for enrichments
 ```
 
 Creates

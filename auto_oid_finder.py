@@ -3,7 +3,7 @@
 auto_oid_finder.py
 ==================
 
-Version: 1.0.18
+Version: 1.0.19
 
 Changelog (short)
 -----------------
@@ -32,6 +32,7 @@ Changelog (short)
 1.0.17: From now filters/filters.yaml is always loaded and all includes via
         --filter-file are merged with it.
 1.0.18: LibreNMS instead of observium + multithread
+1.0.19: Auto detection of junk tables added
 
 
 
@@ -80,7 +81,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import yaml
 
-VERSION = "1.0.18"
+VERSION = "1.0.19"
 
 MIB2_ROOT = ".1.3.6.1.2.1"
 VENDOR_ROOT = ".1.3.6.1.4.1"
@@ -650,6 +651,73 @@ def table_is_interesting(
     log_debug(f"Dropping table {root} because no columns matched LLD regex")
     return False
 
+def table_looks_like_junk(table: dict, columns: list[dict]) -> bool:
+    """
+    Very conservative heuristic to drop obviously useless tables.
+
+    Goals:
+      - Kill things like SNMPv2-SMI::enterprises enumeration tables.
+      - Avoid touching normal metric tables (disk, temp, if*, etc.).
+
+    We only return True when we are very sure it's junk.
+    """
+    root = table.get("root_oid", "") or ""
+    cols = columns or []
+
+    if not cols:
+        # No columns at all → nothing useful
+        return True
+
+    # 1) Pure SNMPv2-SMI::enterprises tables:
+    #    All columns from module "SNMPv2-SMI" and name starting with "enterprises".
+    #    These are just static vendor enumerations, not metrics.
+    all_enterprises = True
+    for c in cols:
+        module = (c.get("module") or "").strip()
+        name = (c.get("name") or "").strip().lower()
+        if module != "SNMPv2-SMI" or not name.startswith("enterprises"):
+            all_enterprises = False
+            break
+
+    if all_enterprises:
+        log_debug(f"Table {root} looks like SNMPv2-SMI::enterprises, marking as junk")
+        return True
+
+    # 2) Single-column pure index tables with boring naming.
+    #    e.g. something like "someIndex" with no interesting description.
+    if len(cols) == 1:
+        c = cols[0]
+        name = (c.get("name") or "").lower()
+        desc = (c.get("description") or "").lower()
+        value_class = (c.get("value_class") or "").upper()
+        sample_type = (c.get("sample_type") or "").upper()
+
+        is_text = (
+            value_class in ("TEXT", "CHAR") or
+            "OCTET STRING" in sample_type
+        )
+
+        # Only consider non-text index columns
+        if not is_text:
+            boring_name_fragments = ("index", "idx")
+            interesting_desc_fragments = (
+                "temp", "temperature", "fan", "disk", "volume",
+                "cpu", "mem", "memory", "power", "voltage",
+                "current", "throughput", "traffic", "speed",
+                "status", "health", "error",
+            )
+
+            if any(f in name for f in boring_name_fragments):
+                if not any(f in desc for f in interesting_desc_fragments):
+                    log_debug(
+                        f"Table {root} has single boring index column "
+                        f"'{c.get('name')}', marking as junk"
+                    )
+                    return True
+
+    # Default: keep the table
+    return False
+
 
 def build_forced_table_for_root(
     root: str,
@@ -751,6 +819,7 @@ def build_profile(
     no_filter: bool,
     use_bulk: bool,
     threads: int,
+    auto_junk: bool = True,
 ) -> tuple[dict, dict]:
     """
     Walk the given roots, collect OIDs, figure out scalars and tables,
@@ -912,7 +981,7 @@ def build_profile(
         t_with_cols["columns"] = cols
         tables_by_root[t["root_oid"]] = t_with_cols
 
-    # Forced tables for every lld.include_roots (only if rows >= 2)
+    # 3) Force tables for every lld.include_roots (only if rows >= 2)
     for forced_root in lld_include_roots:
         if forced_root in tables_by_root:
             continue
@@ -925,6 +994,17 @@ def build_profile(
         if forced_table is not None:
             log_debug(f"Forced LLD table added for root {forced_root}")
             tables_by_root[forced_root] = forced_table
+
+    # 4) Auto-junk detection: filter nutteloze tabellen er weer uit
+    if auto_junk:
+        cleaned: dict[str, dict] = {}
+        for root, t in tables_by_root.items():
+            cols = t.get("columns") or []
+            if table_looks_like_junk(t, cols):
+                log_debug(f"Auto-junk: dropping table {root}")
+                continue
+            cleaned[root] = t
+        tables_by_root = cleaned
 
     tables = list(tables_by_root.values())
 
@@ -1077,7 +1157,7 @@ def main():
     parser.add_argument(
         "--no-observium",
         action="store_true",
-        help="Do not use or prompt for Observium MIBs",
+        help="Do not use or prompt for LibreNMS MIBs",
     )
     parser.add_argument(
         "--version",
@@ -1094,6 +1174,15 @@ def main():
         type=int,
         default=4,
         help="Number of parallel SNMP walks (per root). Default: 4",
+    )
+    parser.add_argument(
+        "--no-auto-junk",
+        action="store_true",
+        help=(
+            "Disable heuristic auto junk detection for LLD tables. "
+            "By default, obvious junk tables like SNMPv2-SMI::enterprises "
+            "are skipped even if they match the filters."
+        ),
     )
 
     pre_args, _ = parser.parse_known_args()
@@ -1275,6 +1364,7 @@ def main():
         no_filter=args.no_filter,
         use_bulk=args.snmp_bulk,
         threads=args.threads,
+        auto_junk=not args.no_auto_junk,
     )
     elapsed = time.time() - t0
 
@@ -1299,7 +1389,7 @@ def main():
     print(f"  Tables detected:  {stats['tables']}")
     print(f"  Output file:      {out_path}")
     print(
-        f"  Observium MIBs:    "
+        f"  LibreNMS MIBs:    "
         f"{'used for enrichment' if observium_dir else 'not used'}"
     )
     print(f"  Elapsed time:     {elapsed:.1f}s")
