@@ -3,31 +3,40 @@
 vendor2enterprise.py
 ====================
 
-Version: 1.1.0
+Version: 1.1.1
 
-Helper tool to map vendor names to IANA enterprise numbers and generate
-a filters/filters_<vendor>.yaml file suitable for auto_oid_finder.py.
+Helper tool to map vendor names to IANA enterprise numbers and optionally
+generate a filters/filters-<vendor>.yml file suitable for auto_oid_finder.py.
 
 Data source for enterprise numbers:
     https://www.iana.org/assignments/enterprise-numbers/
 
-Features:
-  - Fuzzy matching on vendor name (e.g. "nimble", "hpe nimble", "qnap", "cisco").
-  - Prints enterprise ID and .1.3.6.1.4.1.<enterprise> root.
-  - Caches IANA enterprise list locally (data/iana_enterprise_numbers.txt).
-  - Tries to locate vendor MIBs under a LibreNMS-style tree:
-        librenms_mibs/mibs/<vendor>/
-  - Parses MIB files for OBJECT-TYPE names and builds:
-        * vendor.regex       → match interessante metrics
-        * lld.exact_names    → kolomnamen die vaak als LLD-macro nuttig zijn
-  - With --write-filter, generates a filter YAML in filters/:
+Key features:
+  - Downloads and caches the IANA enterprise-numbers file in
+    data/iana_enterprise_numbers.txt
+  - Parses the real IANA layout:
 
-      * If MIBs gevonden → vendor-specifieke filter op basis van MIB-names.
-      * Anders → generic boilerplate filter (backwards compatible).
+        <id>
+          <name>
+              <contact>
+              ...
 
-Usage examples:
-  ./vendor2enterprise.py qnap --write-filter
-  ./vendor2enterprise.py cisco --write-filter
+  - Fuzzy-matches vendor names, e.g.:
+        ./vendor2enterprise.py cisco --write-filter
+        ./vendor2enterprise.py qnap  --write-filter
+
+  - Or bypass IANA and force a specific enterprise ID/name:
+        ./vendor2enterprise.py --enterprise 9 --name "ciscoSystems" --write-filter
+
+  - Writes small vendor extension files that MERGE with filters/filters.yaml:
+        filters/filters-ciscosystems.yml
+        filters/filters-qnap_systems_inc.yml
+
+  - For some vendors (QNAP, Cisco, ...) we use a built-in profile to:
+        * add extra include_roots (QNAP 24681 + 55062)
+        * set lld.exact_names (HdCapacity, HdSmartInfo, ...)
+        * set lld.exclude_roots (junk tables)
+        * set vendor.regex
 """
 
 import argparse
@@ -35,26 +44,19 @@ import os
 import re
 import sys
 import textwrap
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-import ssl
-import urllib.request
+from typing import List, Dict, Any, Tuple
+from urllib.request import urlopen, Request
+from urllib.error import URLError, HTTPError
 
-VERSION = "1.1.0"
-
-# ---------------------------------------------------------------------------
-# Config & paths
-# ---------------------------------------------------------------------------
+VERSION = "1.1.1"
 
 IANA_URL = "https://www.iana.org/assignments/enterprise-numbers/enterprise-numbers"
-DEFAULT_IANA_CACHE = "data/iana_enterprise_numbers.txt"
-DEFAULT_FILTERS_DIR = "filters"
-DEFAULT_MIB_ROOT = "librenms_mibs/mibs"
+DEFAULT_CACHE_PATH = os.path.join("data", "iana_enterprise_numbers.txt")
+
 
 # ---------------------------------------------------------------------------
 # Logging helpers
 # ---------------------------------------------------------------------------
-
 
 def log_info(msg: str) -> None:
     print(f"[info] {msg}")
@@ -69,511 +71,467 @@ def log_error(msg: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# IANA enterprise list handling
+# IANA enterprise-numbers handling
 # ---------------------------------------------------------------------------
 
-
-def ensure_iana_cache(
-    cache_path: str = DEFAULT_IANA_CACHE,
-    force_sync: bool = False,
-    allow_prompt: bool = True,
-) -> Optional[str]:
+def download_iana_cache(cache_path: str) -> bool:
     """
-    Ensure the local IANA enterprise cache exists.
+    Download the IANA enterprise-numbers file and save it as cache_path.
 
-    Returns the path to the cache file, or None if not available.
+    Returns True on success, False otherwise.
     """
-    cache = Path(cache_path)
-
-    if cache.exists() and not force_sync:
-        log_info(f"Using existing IANA cache: {cache}")
-        return str(cache)
-
-    if not allow_prompt and not force_sync:
-        log_warn(f"No IANA cache at {cache} and no sync requested.")
-        return None
-
-    # Ask user if we should download (unless force_sync)
-    if allow_prompt and not force_sync:
-        ans = input(
-            f"[prompt] Download IANA enterprise numbers now into {cache}? [Y/n]: "
-        ).strip().lower()
-        if ans not in ("", "y", "yes"):
-            log_warn("User opted not to download IANA enterprise list.")
-            return None
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
 
     log_info(f"Downloading IANA enterprise numbers from {IANA_URL} ...")
-    cache.parent.mkdir(parents=True, exist_ok=True)
-
+    req = Request(IANA_URL, headers={"User-Agent": "vendor2enterprise/1.1.1"})
     try:
-        ctx = ssl.create_default_context()
-        with urllib.request.urlopen(IANA_URL, context=ctx) as resp:
-            data = resp.read().decode("utf-8", errors="replace")
-        cache.write_text(data, encoding="utf-8")
-        log_info(f"Wrote IANA cache to {cache}")
-        return str(cache)
-    except Exception as e:
-        log_error(f"Failed to download IANA data: {e!r}")
-        return None
+        with urlopen(req, timeout=30) as resp:
+            data = resp.read()
+    except (URLError, HTTPError) as e:
+        log_error(f"Failed to download IANA data: {e}")
+        return False
+
+    text = data.decode("utf-8", errors="replace")
+    with open(cache_path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+    log_info(f"Saved IANA enterprise numbers to {cache_path}")
+    return True
 
 
-def parse_iana_entries(cache_path: str) -> List[Dict[str, Any]]:
+def ensure_iana_cache(cache_path: str) -> str | None:
     """
-    Parse the IANA enterprise file into a list of entries:
-      [{"id": 9, "name": "ciscoSystems", "raw": "9  ciscoSystems ..."}, ...]
+    Ensure the IANA cache file exists. If not, ask the user if we may download it.
 
-    We only look at lines that start with an integer ID.
+    Returns the path if available, or None if not.
     """
-    p = Path(cache_path)
-    text = p.read_text(encoding="utf-8", errors="replace")
+    if os.path.exists(cache_path):
+        log_info(f"Using existing IANA cache: {cache_path}")
+        return cache_path
+
+    # No cache yet: prompt user
+    print(f"[warn] No IANA cache found at: {cache_path}")
+    ans = input("[prompt] Download IANA enterprise numbers now? [Y/n]: ").strip().lower()
+    if ans in ("", "y", "yes"):
+        ok = download_iana_cache(cache_path)
+        if not ok:
+            return None
+        return cache_path
+
+    log_warn("User declined to download IANA enterprise numbers.")
+    return None
+
+
+def parse_iana_entries(text: str) -> List[Dict[str, Any]]:
+    """
+    Parse the content of the IANA enterprise-numbers file.
+
+    The real format is roughly:
+
+        <id>
+          <name>
+              <contact>
+              ...
+
+    So we look for a line that is ONLY digits, treat that as the ID, and then
+    the next non-empty, non-comment line is the name.
+
+    Returns a list of:
+        { "enterprise": <int>, "name": <str> }
+    """
     entries: List[Dict[str, Any]] = []
+    lines = text.splitlines()
+    n = len(lines)
+    i = 0
 
-    for line in text.splitlines():
-        # Typical format: "9   ciscoSystems          ..." OR "9  ciscoSystems"
-        m = re.match(r"^\s*(\d+)\s+([^\t#]+)", line)
-        if not m:
+    while i < n:
+        line = lines[i].strip()
+        # Skip empty or comment lines
+        if not line or line.startswith("#"):
+            i += 1
             continue
-        ent_id = int(m.group(1))
-        name = m.group(2).strip()
-        if not name:
+
+        # ID line: must be all digits
+        if line.isdigit():
+            ent = int(line)
+            name = None
+
+            j = i + 1
+            while j < n:
+                name_line = lines[j].rstrip("\n")
+                stripped = name_line.strip()
+
+                if not stripped:
+                    j += 1
+                    continue
+                if stripped.startswith("#"):
+                    j += 1
+                    continue
+
+                # This is our canonical name
+                name = stripped
+                break
+
+            if name:
+                entries.append({"enterprise": ent, "name": name})
+            i = j if j > i else i + 1
             continue
-        entries.append(
-            {
-                "id": ent_id,
-                "name": name,
-                "raw": line.rstrip(),
-            }
-        )
+
+        # Not an ID, skip
+        i += 1
 
     return entries
 
 
-def fuzzy_find_iana(
-    query: str,
-    entries: List[Dict[str, Any]],
-) -> Optional[Dict[str, Any]]:
+def load_iana_entries(cache_path: str) -> List[Dict[str, Any]]:
     """
-    Fuzzy match the vendor query against IANA 'name' field.
-
-    Scoring:
-      3 = exact match (case-insensitive)
-      2 = query is substring of name or vice versa
-      1 = token overlap / partial word match
+    Load and parse the IANA enterprise-numbers cache.
     """
-    q = query.lower().strip()
-    if not q:
-        return None
-
-    best: Optional[Tuple[int, Dict[str, Any]]] = None
-
-    q_tokens = set(re.split(r"[^a-z0-9]+", q))
-
-    for e in entries:
-        name = e["name"]
-        n = name.lower()
-
-        score = 0
-        if q == n:
-            score = 3
-        elif q in n or n in q:
-            score = 2
-        else:
-            n_tokens = set(re.split(r"[^a-z0-9]+", n))
-            if q_tokens.intersection(n_tokens):
-                score = 1
-
-        if score > 0:
-            if best is None or score > best[0]:
-                best = (score, e)
-
-    return best[1] if best else None
+    with open(cache_path, "r", encoding="utf-8") as f:
+        text = f.read()
+    entries = parse_iana_entries(text)
+    if not entries:
+        log_warn("No entries parsed from IANA cache (unexpected).")
+    return entries
 
 
 # ---------------------------------------------------------------------------
-# MIB directory discovery (LibreNMS-style)
+# Fuzzy matching + helpers
 # ---------------------------------------------------------------------------
 
-
-def slugify_name(name: str) -> str:
+def slugify(name: str) -> str:
+    """
+    Convert to a safe filename slug: letters/numbers/underscore only.
+    """
     s = name.lower()
     s = re.sub(r"[^a-z0-9]+", "_", s)
     s = re.sub(r"_+", "_", s).strip("_")
     return s or "vendor"
 
 
-def find_vendor_mib_dir(
-    vendor_name: str,
-    mib_root: str = DEFAULT_MIB_ROOT,
-) -> Optional[str]:
+def tokenize_name(s: str) -> List[str]:
     """
-    Try to locate a matching vendor MIB directory under mib_root.
-
-    For example:
-      vendor_name = "ciscoSystems"
-      mib_root    = "librenms_mibs/mibs"
-      possible dirs: "cisco", "cisco-wlc", ...
-
-    We pick the best match based on a simple fuzzy scoring.
+    Split a name into simple tokens (letters/digits only), lowercased.
     """
-    root = Path(mib_root)
-    if not root.is_dir():
-        log_warn(f"MIB root '{mib_root}' does not exist; skipping MIB-based tuning.")
-        return None
+    s = s.lower()
+    tokens = re.findall(r"[a-z0-9]+", s)
+    return tokens
 
-    candidates = [d for d in root.iterdir() if d.is_dir()]
-    if not candidates:
-        log_warn(f"No subdirs under MIB root '{mib_root}'.")
-        return None
 
-    v_slug = slugify_name(vendor_name)
-    v_lower = vendor_name.lower()
-    v_tokens = set(re.split(r"[^a-z0-9]+", v_lower))
+def normalize_flat_name(s: str) -> str:
+    """
+    Lowercase, remove non-alnum, concat.  e.g. 'Cisco Systems, Inc.' -> 'ciscosystemsinc'.
+    """
+    return "".join(re.findall(r"[a-z0-9]+", s.lower()))
 
-    best: Optional[Tuple[int, Path]] = None
 
-    for d in candidates:
-        name = d.name
-        n = name.lower()
+def fuzzy_find_iana(query: str, entries: List[Dict[str, Any]]) -> List[Tuple[int, Dict[str, Any]]]:
+    """
+    Fuzzy match query against IANA entries.
+
+    Returns a list of (score, entry) sorted by best score first.
+    """
+    q_tokens = tokenize_name(query)
+    q_str = " ".join(q_tokens)
+    results: List[Tuple[int, Dict[str, Any]]] = []
+
+    for e in entries:
+        name = e["name"]
+        ent = e["enterprise"]
+        name_tokens = tokenize_name(name)
+        name_str = " ".join(name_tokens)
+
         score = 0
 
-        if n == v_slug or n == v_lower:
-            score = 4
-        elif v_slug in n or n in v_slug:
-            score = 3
-        elif v_lower in n or n in v_lower:
-            score = 2
-        else:
-            n_tokens = set(re.split(r"[^a-z0-9]+", n))
-            if v_tokens.intersection(n_tokens):
-                score = 1
+        # Exact normalized match (rare)
+        if q_str == name_str:
+            score += 100
+
+        # Any token exact match (e.g. "cisco" in "ciscoSystems")
+        for qt in q_tokens:
+            if qt in name_tokens:
+                score += 10
+
+        # Substring match on flattened name
+        if q_str and q_str in name_str:
+            score += 5
+
+        # Bonus if vendor name appears at the start
+        if name_tokens and q_tokens and name_tokens[0].startswith(q_tokens[0]):
+            score += 3
 
         if score > 0:
-            if best is None or score > best[0]:
-                best = (score, d)
+            results.append((score, e))
 
-    if not best:
-        log_warn(
-            f"No matching vendor MIB directory found under '{mib_root}' for '{vendor_name}'."
-        )
-        return None
+    results.sort(key=lambda x: (-x[0], x[1]["enterprise"]))
+    return results
 
-    chosen = best[1]
-    log_info(f"Using vendor MIB directory: {chosen}")
-    return str(chosen)
+
+# small hint map for “preferred” entry per query
+PREFERRED_VENDOR_NAMES: Dict[str, List[str]] = {
+    # query_slug -> list of normalized preferred IANA names
+    "cisco": [
+        "ciscosystems",
+        "ciscosystemsinc",
+        "ciscosystemsincformerlyarchrockcorporation",
+    ],
+    "qnap": [
+        "qnapsystemsinc",
+        "qnapinc",
+    ],
+}
+
+
+def choose_best_match(query: str, matches: List[Tuple[int, Dict[str, Any]]]) -> Dict[str, Any]:
+    """
+    From fuzzy matches, optionally bias to a preferred vendor canonical name.
+    For example: for 'cisco' we prefer ciscoSystems (enterprise 9) over 'Cisco's Etc.'.
+    """
+    if not matches:
+        raise ValueError("choose_best_match called with empty matches")
+
+    q_slug = normalize_flat_name(query)
+    preferred_list = PREFERRED_VENDOR_NAMES.get(q_slug)
+    if not preferred_list:
+        # no special preference -> best score
+        return matches[0][1]
+
+    # look for first match whose normalized name is in preferred_list
+    for score, e in matches:
+        n = normalize_flat_name(e["name"])
+        if n in preferred_list:
+            return e
+
+    # fallback to best score
+    return matches[0][1]
 
 
 # ---------------------------------------------------------------------------
-# MIB parser (very lightweight)
+# Vendor profiles (extra roots, junk tables, exact names, regex)
 # ---------------------------------------------------------------------------
 
+# Default generic vendor regex if we don't have a vendor-specific one
+DEFAULT_VENDOR_REGEX = (
+    "("
+    "disk|hdd|ssd|raid|array|lun|volume|pool|storage|"
+    "psu|power|watt|volt|voltage|current|amps?|"
+    "temp|temperature|thermal|fan|rpm|"
+    "status|state|health|error|fail|failed|fault|alarm|alert|critical"
+    ")"
+)
 
-def collect_mib_object_names(mib_dir: str) -> List[str]:
+VENDOR_PROFILES: Dict[str, Dict[str, Any]] = {
+    # Keyed by a simple vendor slug (we will map canonical name/query -> slug)
+    "qnap": {
+        # QNAP has TWO enterprise IDs: 24681 and 55062
+        "extra_include_roots": [
+            ".1.3.6.1.4.1.55062",
+        ],
+        # Columns we always want as LLD if present
+        "lld_exact_names": [
+            "HdCapacity",
+            "HdSmartInfo",
+            "HdTemperature",
+            "hrStorageDescr",
+            "hrStorageSize",
+            "hrStorageUsed",
+            "ifAdminStatus",
+            "ifHCInOctets",
+            "ifHCOutOctets",
+            "ifHighSpeed",
+            "ifInDiscards",
+            "ifInErrors",
+            "ifInOctets",
+            "ifOperStatus",
+            "ifOutDiscards",
+            "ifOutErrors",
+            "ifOutOctets",
+            "ifSpeed",
+            "ifType",
+        ],
+        # Known junk tables we don't want as LLD for QNAP NAS
+        "lld_exclude_roots": [
+            # --- IP / routing / ARP / TCP ---
+            ".1.3.6.1.2.1.4.21",         # ipRouteTable
+            ".1.3.6.1.2.1.4.24",         # ipCidrRouteTable
+            ".1.3.6.1.2.1.4.22",         # ipNetToMediaTable (ARP)
+            ".1.3.6.1.2.1.6.13",         # tcpConnTable
+
+            # --- Host Resources junk/directory tables ---
+            ".1.3.6.1.2.1.25.3.2.1",     # hrDeviceTable
+            ".1.3.6.1.2.1.25.3.7.1.1",   # hrFSIndex-like
+            ".1.3.6.1.2.1.25.3.8.1",     # hrPartitionIndex-like
+            ".1.3.6.1.2.1.25.4.2.1",     # hrSWRunTable
+            ".1.3.6.1.2.1.25.5.1.1",     # hrSWRunPerfTable
+            ".1.3.6.1.2.1.25.3.6.1",     # hrDiskStorageAccess (junk on QNAP)
+
+            # --- Net-SNMP cache tables (no useful metrics) ---
+            ".1.3.6.1.4.1.8072.1.5.3",   # nsCache* (NET-SNMP-AGENT-MIB)
+
+            # --- QNAP NAS-MIB: directory-like trees ---
+            ".1.3.6.1.4.1.24681.1.3.9.1",
+            ".1.3.6.1.4.1.24681.1.4.1.1.1",
+            ".1.3.6.1.4.1.24681.1.4.1.1.2",
+            ".1.3.6.1.4.1.24681.1.4.1.1.3",
+            ".1.3.6.1.4.1.24681.1.4.1.1.4",
+            ".1.3.6.1.4.1.24681.1.4.1.1.5",
+            ".1.3.6.1.4.1.24681.1.2.17.1",
+
+            # --- QNAP 55062 junk tables ---
+            ".1.3.6.1.4.1.55062.1.10.2.1",
+            ".1.3.6.1.4.1.55062.1.10.3.1",
+            ".1.3.6.1.4.1.55062.1.10.5.1",
+            ".1.3.6.1.4.1.55062.1.10.9.1",
+            ".1.3.6.1.4.1.55062.1.10.34.1",
+            ".1.3.6.1.4.1.55062.1.15.1.1",
+        ],
+        # QNAP-specific vendor regex (storage + env + health)
+        "vendor_regex": (
+            "("
+            # Hardware / platform
+            "model|system|hardware|"
+            "chassis|board|"
+            # CPU / load
+            "cpu|processor|load|usage|util|"
+            # Memory
+            "mem|memory|ram|swap|"
+            # Storage
+            "disk|hdd|ssd|raid|array|lun|volume|pool|storage|"
+            # Power / PSU
+            "psu|ps|power|watt|volt|voltage|current|amps?|"
+            # Networking
+            "net|nic|link|throughput|bandwidth|speed|"
+            # Environmental
+            "temp|temperature|thermal|fan|rpm|humidity|"
+            # Health / status
+            "error|errors|fail|failed|fault|"
+            "status|state|health|ok|"
+            "alarm|alert|warning|critical|"
+            # UPS / battery
+            "ups|battery|runtime|charge|capacity"
+            ")"
+        ),
+    },
+
+    # Placeholder for Cisco – for now we just make sure we pick the right
+    # enterprise (9), and you can extend this profile later if you like.
+    "cisco": {
+        "extra_include_roots": [],
+        "lld_exact_names": [],
+        "lld_exclude_roots": [],
+        "vendor_regex": DEFAULT_VENDOR_REGEX,
+    },
+}
+
+
+def detect_vendor_slug(query: str, canonical_name: str) -> str | None:
     """
-    Scan all MIB files under mib_dir and extract OBJECT-TYPE names.
-
-    We only care about lines that look like:
-        someName  OBJECT-TYPE
-
-    Returns a de-duplicated, sorted list of object names.
+    Very simple classifier to map a combination of user query + canonical IANA
+    name to a vendor slug we have a profile for, e.g. "qnap" or "cisco".
     """
-    names: set[str] = set()
-    base = Path(mib_dir)
+    q_tokens = set(tokenize_name(query))
+    c_tokens = set(tokenize_name(canonical_name))
 
-    exts = {".txt", ".my", ".mib", ".asn1"}
+    all_tokens = q_tokens | c_tokens
 
-    for path in base.rglob("*"):
-        if not path.is_file():
-            continue
-        if path.suffix.lower() not in exts:
-            continue
+    if "qnap" in all_tokens:
+        return "qnap"
+    if "cisco" in all_tokens:
+        return "cisco"
 
-        try:
-            text = path.read_text(encoding="utf-8", errors="ignore")
-        except Exception as e:
-            log_warn(f"Failed to read MIB file {path}: {e}")
-            continue
-
-        for line in text.splitlines():
-            # Very common pattern: "HdTemperature OBJECT-TYPE  -- Disk temp"
-            m = re.match(r"^\s*([A-Za-z0-9][A-Za-z0-9\-]*)\s+OBJECT-TYPE\b", line)
-            if not m:
-                continue
-            name = m.group(1).strip()
-            if name:
-                names.add(name)
-
-    result = sorted(names)
-    log_info(f"Collected {len(result)} OBJECT-TYPE names from MIBs in {mib_dir}")
-    return result
-
-
-def classify_names_for_vendor(names: List[str]) -> Tuple[List[str], List[str]]:
-    """
-    Given a list of OBJECT-TYPE names, decide:
-      - which ones are useful for vendor.regex (metrics & statuses)
-      - which ones should go into lld.exact_names (columns that identify rows)
-
-    Returns (vendor_regex_names, exact_names).
-    """
-    vendor_names: List[str] = []
-    exact_names: List[str] = []
-
-    # Keywords – vendor metrics we care about
-    METRIC_KEYWORDS = [
-        "temp",
-        "temperature",
-        "thermal",
-        "fan",
-        "rpm",
-        "speed",
-        "volt",
-        "voltage",
-        "amp",
-        "current",
-        "watt",
-        "power",
-        "psu",
-        "disk",
-        "hdd",
-        "ssd",
-        "raid",
-        "array",
-        "lun",
-        "volume",
-        "pool",
-        "capacity",
-        "size",
-        "usage",
-        "used",
-        "free",
-        "space",
-        "load",
-        "cpu",
-        "mem",
-        "memory",
-        "cache",
-        "bandwidth",
-        "throughput",
-        "errors",
-        "error",
-        "discard",
-        "status",
-        "state",
-        "health",
-        "alarm",
-        "alert",
-        "critical",
-    ]
-
-    # Exact-name candidates – good LLD columns / labels
-    EXACT_HINTS = [
-        "descr",
-        "description",
-        "name",
-        "index",
-        "id",
-        "label",
-        "mount",
-        "fs",
-        "filesystem",
-        "disk",
-        "volume",
-        "slot",
-        "bay",
-        "port",
-    ]
-
-    for n in names:
-        lower = n.lower()
-
-        # Vendor regex: any metric-ish keyword
-        if any(kw in lower for kw in METRIC_KEYWORDS):
-            vendor_names.append(n)
-
-        # exact_names: columns with label/descr/name/capacity/temperature/status etc.
-        score = 0
-        for kw in EXACT_HINTS:
-            if kw in lower:
-                score += 1
-
-        # Bonus for "nice shapes"
-        if lower.endswith(("descr", "description", "name", "index", "id")):
-            score += 2
-
-        if any(
-            kw in lower
-            for kw in [
-                "capacity",
-                "temperature",
-                "temp",
-                "status",
-                "health",
-                "size",
-                "speed",
-                "serial",
-            ]
-        ):
-            score += 1
-
-        if score > 0:
-            exact_names.append(n)
-
-    # Dedup & sort
-    vendor_names = sorted(set(vendor_names))
-    exact_names = sorted(set(exact_names))
-
-    return vendor_names, exact_names
-
-
-def build_vendor_regex_from_names(vendor_names: List[str]) -> Optional[str]:
-    """
-    Turn a list of OBJECT-TYPE names into a vendor.regex pattern.
-
-    We build something like:
-      (HdTemperature|HdCapacity|sysFanSpeed|... )
-
-    To keep regex manageable, we cap the number of names.
-    """
-    if not vendor_names:
-        return None
-
-    MAX_NAMES = 80  # cap to avoid insane regex length
-    selected = vendor_names[:MAX_NAMES]
-
-    # Escape names for regex
-    parts = [re.escape(n) for n in selected]
-    pattern = "|".join(parts)
-
-    # Wrap in non-capturing group to combine with base vendor.regex via OR
-    return f"(?:{pattern})"
+    return None
 
 
 # ---------------------------------------------------------------------------
-# Filter YAML generation
+# Filter YAML generator
 # ---------------------------------------------------------------------------
 
-
-def generate_filter_yaml_from_mibs(
-    ent: int,
-    canonical: str,
-    mib_dir: str,
-) -> str:
+def generate_vendor_filter_yaml(ent: int, canonical: str, vendor_slug: str | None) -> str:
     """
-    Build a vendor-specific filter YAML based on parsed MIB names.
+    Generate a *small* vendor filter extension that extends filters.yaml.
+
+    We only specify:
+      - lld.include_roots -> add the vendor enterprise root (+ any extras)
+      - lld.exact_names   -> optional list of column names to always LLD
+      - lld.exclude_roots -> vendor-specific junk
+      - vendor.regex      -> vendor-specific or generic regex
+
+    The merging is done by auto_oid_finder.py via merge_filter_cfg().
     """
     root = f".1.3.6.1.4.1.{ent}"
-    names = collect_mib_object_names(mib_dir)
-    vendor_names, exact_names = classify_names_for_vendor(names)
-    vendor_pattern = build_vendor_regex_from_names(vendor_names)
 
-    if vendor_pattern:
-        vendor_regex = vendor_pattern
+    profile = VENDOR_PROFILES.get(vendor_slug, {}) if vendor_slug else {}
+
+    include_roots = [root] + profile.get("extra_include_roots", [])
+    exact_names = profile.get("lld_exact_names", [])
+    exclude_roots = profile.get("lld_exclude_roots", [])
+    vendor_regex = profile.get("vendor_regex", DEFAULT_VENDOR_REGEX)
+
+    # YAML generation – we keep it minimal and let filters.yaml do the rest
+    yaml = [
+        "Version: 1.0",
+        "",
+        f"# Vendor: {canonical}",
+        f"# Enterprise ID: {ent}",
+        f"# Vendor OID root: {root}",
+        "",
+        "# This file extends filters.yaml. Only vendor-specific parts need to be included.",
+        "",
+        "lld:",
+        "  include_roots:",
+    ]
+    for r in include_roots:
+        yaml.append(f'    - "{r}"')
+
+    yaml.append("")
+    yaml.append("  # Vendor-specific exact names (auto LLD favourites)")
+    yaml.append("  exact_names:")
+    if exact_names:
+        for name in exact_names:
+            yaml.append(f"    - {name}")
     else:
-        # fallback minimal pattern
-        vendor_regex = "(disk|storage|temp|fan|power|status)"
+        yaml.append("    []")
 
-    # exact_names can be empty – that's fine
-    exact_names_yaml = "\n".join(f"    - {name}" for name in exact_names) if exact_names else "    # (none detected)"
+    yaml.append("")
+    yaml.append("  # Vendor-specific junk tables to exclude from LLD")
+    yaml.append("  exclude_roots:")
+    if exclude_roots:
+        for r in exclude_roots:
+            yaml.append(f'    - "{r}"')
+    else:
+        yaml.append("    []")
 
-    yaml_content = textwrap.dedent(
-        f"""\
-        Version: 1.1-mib
+    yaml.append("")
+    yaml.append("vendor:")
+    yaml.append("  # Vendor-specific regex (can be extended in filters.yaml)")
+    yaml.append(f'  regex: "{vendor_regex}"')
 
-        # Vendor: {canonical}
-        # Enterprise ID: {ent}
-        # Vendor OID root: {root}
-        #
-        # This file extends filters.yaml. Only vendor-specific parts are included.
-        # It was generated from OBJECT-TYPE names found under:
-        #   {mib_dir}
-
-        lld:
-          # Vendor-specific tables we always want to consider (root subtree)
-          include_roots:
-            - "{root}"
-
-          # Columns that are good candidates for LLD macros (MODULE::name)
-          exact_names:
-{exact_names_yaml}
-
-          # Optional vendor-specific LLD exclusions (add here if you find junk tables)
-          exclude_roots: []
-
-        vendor:
-          # Vendor-specific scalar filter based on MIB OBJECT-TYPE names.
-          # This will be OR'ed with the base vendor.regex from filters.yaml.
-          regex: >
-            {vendor_regex}
-        """
-    ).rstrip() + "\n"
-
-    return yaml_content
-
-
-def generate_generic_filter_yaml(ent: int, canonical: str) -> str:
-    """
-    Fallback template for vendors without MIBs or where parsing fails.
-    """
-    root = f".1.3.6.1.4.1.{ent}"
-    return textwrap.dedent(
-        f"""\
-        Version: 1.0-generic
-
-        # Vendor: {canonical}
-        # Enterprise ID: {ent}
-        # Vendor OID root: {root}
-        #
-        # This file extends filters.yaml. Only vendor-specific parts are included.
-
-        lld:
-          include_roots:
-            - "{root}"
-
-          # Example of vendor-specific exact names (empty by default)
-          exact_names: []
-
-          # Example vendor exclusions (user may extend)
-          exclude_roots: []
-
-        vendor:
-          # Minimal generic vendor filter (safe baseline).
-          regex: "(disk|storage|temp|fan|power|status)"
-        """
-    ).rstrip() + "\n"
+    return "\n".join(yaml).rstrip() + "\n"
 
 
 def write_filter_file(
-    enterprise_id: int,
-    canonical_name: str,
+    canonical: str,
+    ent: int,
     filters_dir: str,
-    mib_root: str,
+    vendor_slug: str | None,
     force: bool = False,
 ) -> str:
     """
-    Generate a filters/filters_<slug>.yaml file for the given vendor.
-
+    Generate filters/filters-<slug>.yml for the given vendor.
     Returns the path to the written file.
     """
     os.makedirs(filters_dir, exist_ok=True)
 
-    slug = slugify_name(canonical_name)
-    filename = f"filters-{slug}.yaml"
+    slug = slugify(canonical)
+    filename = f"filters-{slug}.yml"
     path = os.path.join(filters_dir, filename)
 
     if os.path.exists(path) and not force:
         log_warn(f"Filter file already exists: {path}")
-        log_warn("Use --force to overwrite.")
+        print("       Use --force to overwrite.")
         return path
 
-    # Try to locate vendor MIB dir
-    mib_dir = find_vendor_mib_dir(canonical_name, mib_root=mib_root)
-
-    if mib_dir:
-        log_info("Building vendor-specific filter from MIB OBJECT-TYPE names.")
-        content = generate_filter_yaml_from_mibs(enterprise_id, canonical_name, mib_dir)
-    else:
-        log_warn("No vendor MIB directory found; using generic fallback filter.")
-        content = generate_generic_filter_yaml(enterprise_id, canonical_name)
+    content = generate_vendor_filter_yaml(ent, canonical, vendor_slug)
 
     with open(path, "w", encoding="utf-8") as f:
         f.write(content)
@@ -586,38 +544,27 @@ def write_filter_file(
 # Main CLI
 # ---------------------------------------------------------------------------
 
-
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Map vendor name to enterprise ID and generate a filters/*.yaml "
-            "file suitable for auto_oid_finder.py (using filters.yaml as base)."
+            "Map vendor name to IANA enterprise ID and optionally generate "
+            "a filters/filters-<vendor>.yml file."
         )
     )
     parser.add_argument(
         "vendor_name",
-        nargs="+",
-        help="Vendor name (e.g. 'nimble', 'qnap', 'cisco', 'hpe nimble')",
+        nargs="*",
+        help="Vendor name (e.g. 'cisco', 'qnap', 'hpe nimble')",
     )
     parser.add_argument(
         "--write-filter",
         action="store_true",
-        help="Generate a filters/filters-<vendor>.yaml file for the best match.",
+        help="Generate a filters/filters-<vendor>.yml file for the best match.",
     )
     parser.add_argument(
         "--filters-dir",
-        default=DEFAULT_FILTERS_DIR,
-        help=f"Directory where filter files are stored (default: {DEFAULT_FILTERS_DIR}).",
-    )
-    parser.add_argument(
-        "--mib-root",
-        default=DEFAULT_MIB_ROOT,
-        help=f"Root directory of LibreNMS-style MIB tree (default: {DEFAULT_MIB_ROOT}).",
-    )
-    parser.add_argument(
-        "--iana-cache",
-        default=DEFAULT_IANA_CACHE,
-        help=f"Path to local IANA enterprise cache (default: {DEFAULT_IANA_CACHE}).",
+        default="filters",
+        help="Directory where filter files are stored (default: filters).",
     )
     parser.add_argument(
         "--force",
@@ -625,14 +572,13 @@ def main() -> None:
         help="Overwrite existing filter file if it already exists.",
     )
     parser.add_argument(
-        "--force-iana-sync",
-        action="store_true",
-        help="Force re-download of IANA enterprise list into cache.",
-    )
-    parser.add_argument(
         "--enterprise",
         type=int,
-        help="Explicit enterprise ID (skip IANA lookup; still uses vendor_name as canonical).",
+        help="Enterprise ID to use directly (bypass IANA search).",
+    )
+    parser.add_argument(
+        "--name",
+        help="Canonical vendor name to use with --enterprise.",
     )
     parser.add_argument(
         "--version",
@@ -646,85 +592,81 @@ def main() -> None:
         print(f"vendor2enterprise.py version {VERSION}")
         sys.exit(0)
 
+    # 1) Direct enterprise override path
+    if args.enterprise is not None:
+        if not args.name:
+            log_error("When using --enterprise, you must also provide --name.")
+            sys.exit(1)
+
+        ent = args.enterprise
+        canonical = args.name.strip()
+        root = f".1.3.6.1.4.1.{ent}"
+
+        vendor_slug = detect_vendor_slug("", canonical)
+
+        print(f"Enterprise (forced): {ent}")
+        print(f"Canonical name:     {canonical}")
+        print(f"OID root:           {root}")
+        print(f"Vendor profile:     {vendor_slug or 'generic'}")
+
+        print()
+        print("Suggested LLD include:")
+        print(f'  - "{root}"')
+
+        if args.write_filter:
+            print()
+            write_filter_file(canonical, ent, args.filters_dir, vendor_slug, force=args.force)
+
+        sys.exit(0)
+
+    # 2) Normal path: fuzzy match via IANA
+    if not args.vendor_name:
+        log_error("Either vendor_name or --enterprise/--name must be provided.")
+        sys.exit(1)
+
     query = " ".join(args.vendor_name).strip()
-    if not query:
-        parser.error("vendor_name is required")
+    cache_path = ensure_iana_cache(DEFAULT_CACHE_PATH)
+    if not cache_path:
+        log_error("No IANA data available.")
+        sys.exit(1)
 
-    # Determine enterprise ID & canonical name
-    enterprise_id: Optional[int] = args.enterprise
-    canonical_name: Optional[str] = None
-    raw_line: Optional[str] = None
+    entries = load_iana_entries(cache_path)
+    matches = fuzzy_find_iana(query, entries)
+    if not matches:
+        print(f"No matches found for: {query!r}")
+        print("Check the IANA list manually:")
+        print("  https://www.iana.org/assignments/enterprise-numbers/")
+        sys.exit(1)
 
-    if enterprise_id is not None:
-        canonical_name = query
-        log_info(
-            f"Using explicit enterprise ID {enterprise_id} for vendor '{canonical_name}'."
-        )
-    else:
-        # IANA lookup path
-        cache_path = ensure_iana_cache(
-            cache_path=args.iana_cache,
-            force_sync=args.force_iana_sync,
-            allow_prompt=True,
-        )
-        if not cache_path:
-            log_error(
-                "No IANA data available and no --enterprise provided.\n"
-                "Check the IANA list manually:\n"
-                "  https://www.iana.org/assignments/enterprise-numbers/"
-            )
-            sys.exit(1)
+    best = choose_best_match(query, matches)
+    ent = best["enterprise"]
+    canonical = best["name"]
+    root = f".1.3.6.1.4.1.{ent}"
 
-        entries = parse_iana_entries(cache_path)
-        if not entries:
-            log_error(
-                "IANA cache appears empty or could not be parsed.\n"
-                "Check the file or re-download."
-            )
-            sys.exit(1)
+    vendor_slug = detect_vendor_slug(query, canonical)
 
-        best = fuzzy_find_iana(query, entries)
-        if not best:
-            print(f"No matches found for: {query!r}")
-            print("Check the IANA list manually:")
-            print("  https://www.iana.org/assignments/enterprise-numbers/")
-            sys.exit(1)
-
-        enterprise_id = best["id"]
-        canonical_name = best["name"]
-        raw_line = best["raw"]
-
-    # Safety assertion
-    assert enterprise_id is not None
-    assert canonical_name is not None
-
-    root = f".1.3.6.1.4.1.{enterprise_id}"
-
-    print(f"Best match:   {canonical_name}")
-    print(f"Enterprise:   {enterprise_id}")
+    print(f"Best match:   {canonical}")
+    print(f"Enterprise:   {ent}")
     print(f"OID root:     {root}")
-    if raw_line:
-        print(f"Raw entry:      {raw_line}")
+    print(f"Raw entry:    {canonical}")
+    print(f"Vendor profile: {vendor_slug or 'generic'}")
 
     print()
     print("Suggested LLD include:")
     print(f'  - "{root}"')
+    if vendor_slug == "qnap":
+        # hint that we also include 55062 in the filter file
+        print("  (filter file will also include .1.3.6.1.4.1.55062 for QNAP)")
 
-    slug = slugify_name(canonical_name)
-    filter_file = f"filters-{slug}.yaml"
+    slug = slugify(canonical)
+    filter_file = f"filters-{slug}.yml"
     print()
     print("Suggested filter filename:")
     print(f"  {args.filters_dir}/{filter_file}")
 
     if args.write_filter:
         print()
-        write_filter_file(
-            enterprise_id=enterprise_id,
-            canonical_name=canonical_name,
-            filters_dir=args.filters_dir,
-            mib_root=args.mib_root,
-            force=args.force,
-        )
+        write_filter_file(canonical, ent, args.filters_dir, vendor_slug, force=args.force)
 
 
 if __name__ == "__main__":
