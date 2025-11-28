@@ -1,11 +1,11 @@
 Version: 1.0-nimble
-
-# EXTENSIE op filters.yaml voor HPE Nimble:
-# we focussen op volTable en algemene array health
+# EXTENSION of filters.yaml for HPE Nimble Storage
+# This file only overrides vendor-specific parts.
 
 lld:
+  include_roots:
+    - ".1.3.6.1.4.1.37447.1"
   exact_names:
-    # Volume tabel (NIMBLE-MIB)
     - volName
     - volSizeLow
     - volSizeHigh
@@ -15,9 +15,12 @@ lld:
     - volReserveHigh
     - volOnline
     - volNumConnections
+    - volIoWriteLatency
+    - volDiskVolBytesUsed
+    - volDiskSnapBytesUsed
+  exclude_roots:
 
-    # Je kan later nog meer namen toevoegen (array- of disk-gerelateerd)
-
-  include_roots:
-    - ".1.3.6.1.4.1.37447.1"   # nimble::variables (volTable + andere tabellen)
+vendor:
+  # Vendor-specific regex (can be extended in filters.yaml)
+  regex: "(disk|hdd|ssd|raid|array|lun|volume|pool|storage|psu|power|watt|volt|voltage|current|amps?|temp|temperature|thermal|fan|rpm|status|state|health|error|fail|failed|fault|alarm|alert|critical)"
 

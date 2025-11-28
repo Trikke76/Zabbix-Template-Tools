@@ -1,0 +1,16 @@
+Version: 1.0-cisco
+
+# EXTENSION of filters.yaml for ciscoSystems
+# This file only overrides vendor-specific parts.
+
+lld:
+  include_roots:
+    - .1.3.6.1.4.1.9
+
+  exact_names: []
+
+  exclude_roots: []
+
+vendor:
+  # Vendor-specific regex (can be extended in filters.yaml)
+  regex: "(disk|hdd|ssd|raid|array|lun|volume|pool|storage|psu|power|watt|volt|voltage|current|amps?|temp|temperature|thermal|fan|rpm|status|state|health|error|fail|failed|fault|alarm|alert|critical)"

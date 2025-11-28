@@ -349,3 +349,96 @@ Contributions are welcome:
 
 Goal: build the most complete automated SNMP → Zabbix toolkit.
 
+## 2. Identify "junk" trees (to exclude)
+
+Typical junk patterns:
+- Directory-like HR-MIB paths
+- Routing tables
+- ARP tables
+- TCP connection tables
+- Very large binary tables
+- Empty config structures
+
+Add exclusions:
+
+```
+lld:
+  exclude_roots:
+    - ".1.3.6.1.2.1.4.21"      # ipRouteTable
+    - ".1.3.6.1.2.1.6.13"      # tcpConnTable
+    - ".1.3.6.1.2.1.25.3.2.1"  # hrDeviceTable
+```
+Vendor-specific junk goes here too.
+
+## 3. Define exact_names for LLD
+
+This forces specific columns to ALWAYS appear in item prototypes.
+
+Example (QNAP disks):
+
+```
+lld:
+  exact_names:
+    - HdSmartInfo
+    - HdTemperature
+    - HdCapacity
+
+```
+Example (Nimble volumes):
+
+```
+lld:
+  exact_names:
+    - volName
+    - volReserveLow
+    - volUsageHigh
+```
+
+## 4. Define vendor scalar regex
+
+This controls which scalar values we keep:
+
+```
+vendor:
+  regex: "(disk|ssd|raid|temp|fan|power|voltage|health|status)"
+```
+
+## QNAP Workflow Example (Full)
+
+### 1) Generate vendor filter (optional)
+
+```
+./vendor2enterprise.py qnap --write-filter
+```
+
+Creates
+
+```
+filters/filters-qnap.yml
+```
+
+### 2) Run SNMP scanner
+
+```
+./auto_oid_finder.py \
+    --host 192.168.0.107 \
+    --community public \
+    --filter-file filters/filters-qnap.yml \
+    --snmp-bulk --threads 4 --timeout 10
+```
+
+QNAP output includes:
+
+- Disk tables (HdDescr, HdTemperature, HdSmartInfo…)
+- RAID/pool tables
+- Fan/temperature sensors
+- NICs
+- PSU status
+
+### 3) Generate Zabbix template
+
+```
+./oid2zabbix-template.py export_yaml/auto_oid_*.yaml \
+    --name "Template SNMP QNAP"
+```
+Import into Zabbix → Done

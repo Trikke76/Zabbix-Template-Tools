@@ -1,16 +1,24 @@
-Version: 1.0-qnap
-# EXTENSION of filters.yaml for QNAP SYSTEMS, INC
-# This file only overrides vendor-specific parts.
+Version: 1.2-qnap
+
+# QNAP-specific extension on top of filters.yaml
 
 lld:
-  include_roots:
-    - ".1.3.6.1.4.1.24681"
-    - ".1.3.6.1.4.1.55062"
+    # New: exact MIB names – must match *label* exactly
   exact_names:
     - HdSmartInfo
     - HdCapacity
     - HdTemperature
+    - HdTemperature
+
+
+  # QNAP vendor trees die we voor LLD interessant vinden
+  include_roots:
+    - ".1.3.6.1.4.1.24681"      # QNAP NAS-MIB root
+    - ".1.3.6.1.4.1.55062"      # QNAP QTS enterprise root (sysObjectID)
+
+  # QNAP-tabellen die we bijna nooit willen als LLD (rommel / directory-structuren)
   exclude_roots:
+    # QNAP NAS-MIB: directory-like storageSystem/confSystem trees
     - ".1.3.6.1.4.1.24681.1.3.9.1"
     - ".1.3.6.1.4.1.24681.1.4.1.1.1"
     - ".1.3.6.1.4.1.24681.1.4.1.1.2"
@@ -22,9 +30,10 @@ lld:
     - ".1.3.6.1.4.1.55062.1.10.9.1"
     - ".1.3.6.1.4.1.55062.1.10.34.1"
     - ".1.3.6.1.4.1.55062.1.15.1.1"
+
+    # QNAP 55062 junk tables
     - ".1.3.6.1.4.1.55062.1.10.2.1"
     - ".1.3.6.1.4.1.55062.1.10.3.1"
+    - ".1.3.6.1.2.1.25.3.6.1"
 
-vendor:
-  # Vendor-specific regex (can be extended in filters.yaml)
-  regex: "(disk|hdd|ssd|raid|array|lun|volume|pool|storage|psu|power|watt|volt|voltage|current|amps?|temp|temperature|thermal|fan|rpm|status|state|health|error|fail|failed|fault|alarm|alert|critical)"
+
